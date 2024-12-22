@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "archive-indexer"
+version = "0.0.1"
+dependencies = [
+    "msgpack",
+    "plyvel",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+archive-indexer = "arindexer.cli:archive_indexer"
