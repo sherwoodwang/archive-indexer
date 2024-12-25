@@ -74,6 +74,11 @@ class FileHandle:
 
 
 class Archive:
+    __CONFIG_PREFIX = b'c:'
+    __FILE_HASH_PREFIX = b'h:'
+
+    __CONFIG_HASH_ALGORITHM = 'hash-algorithm'
+
     def __init__(self, processor: Processor, path: str):
         archive_path = Path(path)
 
@@ -91,7 +96,8 @@ class Archive:
         database = None
         try:
             database = plyvel.DB(str(database_path), create_if_missing=True)
-            file_hash_database: plyvel.DB = database.prefixed_db(b'file-hash:')
+            config_database: plyvel.DB = database.prefixed_db(Archive.__CONFIG_PREFIX)
+            file_hash_database: plyvel.DB = database.prefixed_db(Archive.__FILE_HASH_PREFIX)
         except:
             if database is not None:
                 database.close()
@@ -100,6 +106,7 @@ class Archive:
         self._processor = processor
         self._alive = True
         self._database = database
+        self._config_database = config_database
         self._file_hash_database = file_hash_database
         self._archive_path = archive_path
 
@@ -141,12 +148,22 @@ class Archive:
                     # TODO
                     pass
 
+        self._write_config(Archive.__CONFIG_HASH_ALGORITHM, 'sha256')
+
     def filter(self, input: Path, output: Path):
         asyncio.run(self._do_filter(input, output))
 
     async def _do_filter(self, input: Path, output: Path):
         if output.exists():
             raise FileExistsError(f"File {output} already exists")
+
+        hash_algorithm = self._read_config(Archive.__CONFIG_HASH_ALGORITHM)
+
+        if hash_algorithm is None:
+            raise RuntimeError("The index hasn't been build")
+
+        if hash_algorithm != 'sha256':
+            raise RuntimeError(f"Unknown hash algorithm: {hash_algorithm}")
 
         async with ThrottlingTaskGroup(self._processor.concurrency) as tg:
             async def handle_file(path: Path, handle: FileHandle):
@@ -177,18 +194,37 @@ class Archive:
     def inspect(self):
         for key, value in self._database.iterator():
             key: bytes
-            if key.startswith(b'file-hash:'):
-                hex_digest = key[len('file-hash:'):].hex()
+            if key.startswith(Archive.__CONFIG_PREFIX):
+                entry = key[len(Archive.__CONFIG_PREFIX):].decode()
+                print('config', entry, value.decode())
+            elif key.startswith(Archive.__FILE_HASH_PREFIX):
+                hex_digest = key[len(Archive.__FILE_HASH_PREFIX):].hex()
                 print('file-hash', hex_digest, msgpack.loads(value))
             else:
                 print('OTHER', key, value)
 
     def _truncate(self):
+        self._write_config(Archive.__CONFIG_HASH_ALGORITHM, None)
+
         with self._file_hash_database.iterator() as it:
             batch = self._file_hash_database.write_batch()
             for key, _ in it:
                 batch.delete(key)
             batch.write()
+
+    def _write_config(self, entry: str, value: str | None) -> None:
+        if value is None:
+            self._config_database.delete(entry.encode())
+        else:
+            self._config_database.put(entry.encode(), value.encode())
+
+    def _read_config(self, entry: str) -> str | None:
+        value = self._config_database.get(entry.encode())
+
+        if value is not None:
+            value = value.decode()
+
+        return value
 
     def _register_file(self, handle: FileHandle, digest: bytes) -> None:
         current = self._lookup_file(digest)
