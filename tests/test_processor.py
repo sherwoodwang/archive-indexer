@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import tempfile
 import unittest
@@ -107,45 +108,15 @@ class ProcessorTest(unittest.TestCase):
             f.flush()
 
             with Processor() as processor:
-                context = processor.make_context()
-                pipeline = context.sha256(Path(f.name))
+                async def verify():
+                    digest = await processor.sha256(Path(f.name))
 
-                def verify(digest):
                     nonlocal completed
                     self.assertEqual(
                         digest.hex(), "d8539a89a9bd029c9b9815c54f43dbd9c7c4bd10508190d162de6a2e23f28ceb")
                     completed = True
 
-                pipeline.on_result(verify)
-
-                for pipeline in context.fetch_ready_pipelines(blocking=True):
-                    pipeline.execute()
-
-        self.assertTrue(completed)
-
-    def test_coroutine(self):
-        completed = False
-
-        with tempfile.NamedTemporaryFile() as f:
-            f.write(b'test content')
-            f.flush()
-
-            with Processor() as processor:
-                context = processor.make_context()
-                pipeline = context.sha256(Path(f.name))
-
-                async def verify(digest):
-                    nonlocal completed
-                    again = await context.sha256(Path(f.name))
-                    self.assertEqual(digest, again)
-                    self.assertEqual(digest, bytes.fromhex(
-                        '6ae8a75555209fd6c44157c0aed8016e763ff435a19cf186f76863140143ff72'))
-                    completed = True
-
-                pipeline.on_result(verify)
-
-                for pipeline in context.fetch_ready_pipelines(blocking=True):
-                    pipeline.execute()
+                asyncio.run(verify())
 
         self.assertTrue(completed)
 

@@ -1,6 +1,7 @@
+import asyncio
 import os
 import stat
-from functools import partial
+from asyncio import TaskGroup, Semaphore
 from pathlib import Path
 from typing import Iterator
 
@@ -8,6 +9,27 @@ import msgpack
 import plyvel
 
 from ._processor import Processor
+
+
+class ThrottlingTaskGroup(TaskGroup):
+    def __init__(self, concurrency: int):
+        super().__init__()
+        self._semaphore = Semaphore(concurrency)
+
+    async def schedule(self, coro, name=None, context=None):
+        await self._semaphore.acquire()
+
+        async def wrapper():
+            try:
+                return await coro
+            finally:
+                self._semaphore.release()
+
+        try:
+            super().create_task(wrapper(), name=name, context=context)
+        except:
+            self._semaphore.release()
+            raise
 
 
 class FileHandle:
@@ -103,64 +125,54 @@ class Archive:
         self._database = None
 
     def rebuild(self):
+        asyncio.run(self._do_rebuild())
+
+    async def _do_rebuild(self):
         self._truncate()
 
-        context = self._processor.make_context()
+        async with ThrottlingTaskGroup(self._processor.concurrency) as tg:
+            async def handle_file(path: Path, handle: FileHandle):
+                self._register_file(handle, await self._processor.sha256(path))
 
-        def process_results(blocking=False):
-            for p in context.fetch_ready_pipelines(blocking):
-                p.execute()
-
-        for path, handle in self._walk_archive():
-            process_results()
-
-            if handle.is_file():
-                pipeline = context.sha256(path)
-                pipeline.on_result(partial(self._register_file, path, handle))
-            else:
-                # TODO
-                pass
-
-        process_results(blocking=True)
+            for path, handle in self._walk_archive():
+                if handle.is_file():
+                    await tg.schedule(handle_file(path, handle))
+                else:
+                    # TODO
+                    pass
 
     def filter(self, input: Path, output: Path):
+        asyncio.run(self._do_filter(input, output))
+
+    async def _do_filter(self, input: Path, output: Path):
         if output.exists():
             raise FileExistsError(f"File {output} already exists")
 
-        context = self._processor.make_context()
-
-        def process_results(blocking=False):
-            for p in context.fetch_ready_pipelines(blocking):
-                p.execute()
-
-        async def handle_file(path: Path, handle: FileHandle, digest: bytes):
-            for candidate in self._lookup_file(digest):
-                candidate = Path(*candidate)
-                if await context.compare(self._archive_path / candidate, path):
-                    break
-            else:
-                (output / handle.relative_path()).hardlink_to(path)
-
-        for path, handle in self._walk(input):
-            process_results()
-
-            if path.is_dir():
-                # TODO
-                #  1. avoid creating archived directories
-                #  2. change mode after all files are linked
-                relative_path = handle.relative_path()
-                if relative_path is None:
-                    output.mkdir()
+        async with ThrottlingTaskGroup(self._processor.concurrency) as tg:
+            async def handle_file(path: Path, handle: FileHandle):
+                digest = await self._processor.sha256(path)
+                for candidate in self._lookup_file(digest):
+                    candidate = Path(*candidate)
+                    if await self._processor.compare(self._archive_path / candidate, path):
+                        break
                 else:
-                    (output / relative_path).mkdir()
-            elif path.is_file():
-                pipeline = context.sha256(path)
-                pipeline.on_result(partial(handle_file, path, handle))
-            else:
-                # TODO
-                pass
+                    (output / handle.relative_path()).hardlink_to(path)
 
-        process_results(blocking=True)
+            for path, handle in self._walk(input):
+                if path.is_dir():
+                    # TODO
+                    #  1. avoid creating archived directories
+                    #  2. change mode after all files are linked
+                    relative_path = handle.relative_path()
+                    if relative_path is None:
+                        output.mkdir()
+                    else:
+                        (output / relative_path).mkdir()
+                elif path.is_file():
+                    await tg.schedule(handle_file(path, handle))
+                else:
+                    # TODO
+                    pass
 
     def inspect(self):
         for key, value in self._database.iterator():
@@ -178,7 +190,7 @@ class Archive:
                 batch.delete(key)
             batch.write()
 
-    def _register_file(self, path: Path, handle: FileHandle, digest: bytes) -> None:
+    def _register_file(self, handle: FileHandle, digest: bytes) -> None:
         current = self._lookup_file(digest)
         current.append([str(part) for part in handle.relative_path().parts])
         data = msgpack.dumps(current)
