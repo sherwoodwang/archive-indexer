@@ -1,13 +1,15 @@
+import argparse
 import os
 import sys
-import argparse
 from pathlib import Path
 
-from . import Archive, Processor
+from . import Archive, Processor, Tracker
+
 
 def archive_indexer():
     parser = argparse.ArgumentParser()
     parser.add_argument('--archive')
+    parser.add_argument('--verbose', action='store_true')
     parser.add_argument('subcommand')
     parser.add_argument('arguments', nargs='*')
 
@@ -20,8 +22,12 @@ def archive_indexer():
         else:
             archive_path = os.getcwd()
 
+    tracker = Tracker()
+    if args.verbose:
+        tracker.verbosity = 1
+
     with Processor() as processor:
-        with Archive(processor, archive_path) as archive:
+        with Archive(processor, archive_path, tracker=tracker) as archive:
             if args.subcommand == 'rebuild':
                 archive.rebuild()
             elif args.subcommand == 'filter':

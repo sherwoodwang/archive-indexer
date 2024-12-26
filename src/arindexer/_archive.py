@@ -11,9 +11,9 @@ import plyvel
 from ._processor import Processor
 
 
-class ThrottlingTaskGroup(TaskGroup):
-    def __init__(self, concurrency: int):
-        super().__init__()
+class Throttler:
+    def __init__(self, task_group: TaskGroup, concurrency: int):
+        self._task_group = task_group
         self._semaphore = Semaphore(concurrency)
 
     async def schedule(self, coro, name=None, context=None):
@@ -26,7 +26,7 @@ class ThrottlingTaskGroup(TaskGroup):
                 self._semaphore.release()
 
         try:
-            super().create_task(wrapper(), name=name, context=context)
+            self._task_group.create_task(wrapper(), name=name, context=context)
         except:
             self._semaphore.release()
             raise
@@ -73,14 +73,29 @@ class FileHandle:
         return stat.S_ISREG(self.stat.st_mode)
 
 
+class Tracker:
+    def __init__(self):
+        self.verbosity = 0
+
+    def log_skipping(self, path, equivalent):
+        if self.verbosity >= 1:
+            print(f"skipping: {path}\n\tidentical file: {equivalent}")
+
+    def log_keeping(self, path: Path):
+        if self.verbosity >= 1:
+            print(f"keeping: {path}")
+
 class Archive:
     __CONFIG_PREFIX = b'c:'
     __FILE_HASH_PREFIX = b'h:'
 
     __CONFIG_HASH_ALGORITHM = 'hash-algorithm'
 
-    def __init__(self, processor: Processor, path: str):
+    def __init__(self, processor: Processor, path: str, tracker: Tracker | None = None):
         archive_path = Path(path)
+
+        if tracker is None:
+            tracker = Tracker()
 
         if not archive_path.exists():
             raise FileNotFoundError(f"Archive {archive_path} does not exist")
@@ -104,11 +119,12 @@ class Archive:
             raise
 
         self._processor = processor
+        self._archive_path = archive_path
+        self._tracker = tracker
         self._alive = True
         self._database = database
         self._config_database = config_database
         self._file_hash_database = file_hash_database
-        self._archive_path = archive_path
 
     def __del__(self):
         self.close()
@@ -137,13 +153,15 @@ class Archive:
     async def _do_rebuild(self):
         self._truncate()
 
-        async with ThrottlingTaskGroup(self._processor.concurrency) as tg:
+        async with TaskGroup() as tg:
+            throttler = Throttler(tg, self._processor.concurrency * 2)
+
             async def handle_file(path: Path, handle: FileHandle):
                 self._register_file(handle, await self._processor.sha256(path))
 
             for path, handle in self._walk_archive():
                 if handle.is_file():
-                    await tg.schedule(handle_file(path, handle))
+                    await throttler.schedule(handle_file(path, handle))
                 else:
                     # TODO
                     pass
@@ -165,15 +183,19 @@ class Archive:
         if hash_algorithm != 'sha256':
             raise RuntimeError(f"Unknown hash algorithm: {hash_algorithm}")
 
-        async with ThrottlingTaskGroup(self._processor.concurrency) as tg:
+        async with TaskGroup() as tg:
+            throttler = Throttler(tg, self._processor.concurrency * 2)
+
             async def handle_file(path: Path, handle: FileHandle):
                 digest = await self._processor.sha256(path)
                 for candidate in self._lookup_file(digest):
                     candidate = Path(*candidate)
                     if await self._processor.compare(self._archive_path / candidate, path):
+                        self._tracker.log_skipping(handle.relative_path(), candidate)
                         break
                 else:
                     (output / handle.relative_path()).hardlink_to(path)
+                    self._tracker.log_keeping(handle.relative_path())
 
             for path, handle in self._walk(input):
                 if path.is_dir():
@@ -186,7 +208,7 @@ class Archive:
                     else:
                         (output / relative_path).mkdir()
                 elif path.is_file():
-                    await tg.schedule(handle_file(path, handle))
+                    await throttler.schedule(handle_file(path, handle))
                 else:
                     # TODO
                     pass
