@@ -1,3 +1,4 @@
+import abc
 import asyncio
 import os
 import stat
@@ -69,14 +70,13 @@ class LockTable:
 
 
 class FileDifferenceKind(StrEnum):
-    CONTENT = 'content'
     ATIME = 'atime'
     CTIME = 'ctime'
     MTIME = 'mtime'
     BIRTHTIME = 'birthtime'
 
 
-class IgnoredFileDifferencePattern:
+class FileMetadataDifferencePattern:
     def __init__(self):
         self._ignored_patterns: set[FileDifferenceKind] = set()
 
@@ -84,18 +84,12 @@ class IgnoredFileDifferencePattern:
         self.ignore(FileDifferenceKind.ATIME)
         self.ignore(FileDifferenceKind.CTIME)
 
-    def ignore_all_except_content(self):
+    def ignore_all(self):
         for kind in FileDifferenceKind:
             kind: FileDifferenceKind
-            if kind == FileDifferenceKind.CONTENT:
-                continue
-
             self.ignore(kind)
 
     def ignore(self, kind: FileDifferenceKind):
-        if kind == FileDifferenceKind.CONTENT:
-            raise ValueError()
-
         self._ignored_patterns.add(kind)
 
     def is_ignored(self, diff_desc: tuple[str, any, any]) -> bool:
@@ -105,8 +99,8 @@ class IgnoredFileDifferencePattern:
         return [diff for diff in diffs if not self.is_ignored(diff)]
 
 
-IgnoredFileDifferencePattern.ALL_EXCEPT_CONTENT = IgnoredFileDifferencePattern()
-IgnoredFileDifferencePattern.ALL_EXCEPT_CONTENT.ignore_all_except_content()
+FileMetadataDifferencePattern.ALL = FileMetadataDifferencePattern()
+FileMetadataDifferencePattern.ALL.ignore_all()
 
 
 class FileHandle:
@@ -150,20 +144,29 @@ class FileHandle:
         return stat.S_ISREG(self.stat.st_mode)
 
 
-class Tracker:
+class Output(metaclass=abc.ABCMeta):
     def __init__(self):
         self.verbosity = 0
 
-    def log_skipping(self, path, equivalent, diffs):
-        if self.verbosity >= 1:
-            print(f"skipping: {path}")
-            print(f"\tidentical file: {equivalent}")
-            for diff in diffs:
-                print(f"\tignored difference: {diff[0]} {diff[1]} != {diff[2]}")
+    @abc.abstractmethod
+    def _produce(self, record):
+        raise NotImplementedError()
 
-    def log_keeping(self, path: Path):
+    def produce_duplicate(self, path, equivalent, diffs):
+        self._produce(str(path))
+
         if self.verbosity >= 1:
-            print(f"keeping: {path}")
+            self._produce(f"# identical file: {equivalent}")
+            for diff in diffs:
+                self._produce(f"# ignored difference: {diff[0]} {diff[1]} != {diff[2]}")
+
+
+class StandardOutput(Output):
+    def __init__(self):
+        super().__init__()
+
+    def _produce(self, record):
+        print(record)
 
 
 class Archive:
@@ -172,11 +175,11 @@ class Archive:
 
     __CONFIG_HASH_ALGORITHM = 'hash-algorithm'
 
-    def __init__(self, processor: Processor, path: str, tracker: Tracker | None = None):
+    def __init__(self, processor: Processor, path: str, output: Output | None = None):
         archive_path = Path(path)
 
-        if tracker is None:
-            tracker = Tracker()
+        if output is None:
+            output = StandardOutput()
 
         if not archive_path.exists():
             raise FileNotFoundError(f"Archive {archive_path} does not exist")
@@ -201,7 +204,7 @@ class Archive:
 
         self._processor = processor
         self._archive_path = archive_path
-        self._tracker = tracker
+        self._output = output
         self._alive = True
         self._database = database
         self._config_database = config_database
@@ -255,8 +258,7 @@ class Archive:
                         if next_ec_id <= ec_id:
                             next_ec_id = ec_id + 1
 
-                        if not IgnoredFileDifferencePattern.ALL_EXCEPT_CONTENT.filter(
-                                await self._processor.compare(path, self._archive_path / paths[0])):
+                        if await self._processor.compare_content(path, self._archive_path / paths[0]):
                             paths.append(handle.relative_path())
                             self._register_file_equivalents(digest, ec_id, paths)
                             break
@@ -272,15 +274,12 @@ class Archive:
 
         self._write_config(Archive.__CONFIG_HASH_ALGORITHM, self._default_hash_algorithm)
 
-    def filter(self, input: Path, output: Path, ignore: IgnoredFileDifferencePattern | None = None):
-        asyncio.run(self._do_filter(input, output, ignore=ignore))
+    def find_duplicates(self, input: Path, ignore: FileMetadataDifferencePattern | None = None):
+        asyncio.run(self._do_find_duplicates(input, ignore=ignore))
 
-    async def _do_filter(self, input: Path, output: Path, ignore: IgnoredFileDifferencePattern | None):
+    async def _do_find_duplicates(self, input: Path, ignore: FileMetadataDifferencePattern | None):
         if ignore is None:
-            ignore = IgnoredFileDifferencePattern()
-
-        if output.exists():
-            raise FileExistsError(f"File {output} already exists")
+            ignore = FileMetadataDifferencePattern()
 
         hash_algorithm = self._read_config(Archive.__CONFIG_HASH_ALGORITHM)
 
@@ -297,26 +296,29 @@ class Archive:
 
             async def handle_file(path: Path, handle: FileHandle):
                 digest = await calculate_digest(path)
+
                 for ec_id, paths in self._lookup_file_equivalents(digest):
-                    diffs = await self._processor.compare(self._archive_path / paths[0], path)
-                    major_diffs = [diff for diff in diffs if not ignore.is_ignored(diff)]
-                    if not major_diffs:
-                        self._tracker.log_skipping(handle.relative_path(), paths[0], diffs)
+                    if await self._processor.compare_content(self._archive_path / paths[0], path):
+                        for candidate in paths:
+                            diffs = await self._processor.compare_metadata(self._archive_path / candidate, path)
+                            major_diffs = [diff for diff in diffs if not ignore.is_ignored(diff)]
+                            if not major_diffs:
+                                equivalent = candidate
+                                break
+                        else:
+                            continue
                         break
                 else:
-                    (output / handle.relative_path()).hardlink_to(path)
-                    self._tracker.log_keeping(handle.relative_path())
+                    return
+
+                self._output.produce_duplicate(handle.relative_path(), equivalent, diffs)
 
             for path, handle in self._walk(input):
                 if path.is_dir():
                     # TODO
                     #  1. avoid creating archived directories
                     #  2. change mode after all files are linked
-                    relative_path = handle.relative_path()
-                    if relative_path is None:
-                        output.mkdir()
-                    else:
-                        (output / relative_path).mkdir()
+                    pass
                 elif path.is_file():
                     await throttler.schedule(handle_file(path, handle))
                 else:

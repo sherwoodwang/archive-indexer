@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from arindexer import Archive, IgnoredFileDifferencePattern, FileDifferenceKind
+from arindexer import Archive, FileMetadataDifferencePattern, FileDifferenceKind, Output
 # noinspection PyProtectedMember
 from arindexer._processor import Processor
 
@@ -138,23 +138,29 @@ class ArchiveTest(unittest.TestCase):
                     )
 
                 target = Path(tmpdir) / 'target'
-                target_filtered = Path(tmpdir) / 'targets_filtered'
 
                 target.mkdir()
                 generate(target / 'sample-a', 'sample5')
                 generate(target / 'sample-b', 'sample72')
                 generate(target / 'retained', 'retained')
 
-                with Archive(processor, str(archive_path)) as archive:
-                    diffptn = IgnoredFileDifferencePattern()
+                class CollectingOutput(Output):
+                    def __init__(self):
+                        super().__init__()
+                        self.data = []
+
+                    def _produce(self, record):
+                        self.data.append(record)
+
+                output = CollectingOutput()
+                with Archive(processor, str(archive_path), output=output) as archive:
+                    diffptn = FileMetadataDifferencePattern()
                     diffptn.ignore(FileDifferenceKind.ATIME)
                     diffptn.ignore(FileDifferenceKind.CTIME)
                     diffptn.ignore(FileDifferenceKind.MTIME)
-                    archive.filter(target, target_filtered, ignore=diffptn)
+                    archive.find_duplicates(target, ignore=diffptn)
 
-                    self.assertTrue((target_filtered / 'retained').exists())
-                    self.assertFalse((target_filtered / 'sample-a').exists())
-                    self.assertFalse((target_filtered / 'sample-b').exists())
+                    self.assertEqual(set(output.data), {'sample-a', 'sample-b'})
 
     def test_rebuild_with_collision(self):
         with tempfile.TemporaryDirectory() as tmpdir:

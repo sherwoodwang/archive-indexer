@@ -3,7 +3,7 @@ import os
 import sys
 from pathlib import Path
 
-from . import Archive, Processor, Tracker, IgnoredFileDifferencePattern, FileDifferenceKind
+from . import Archive, Processor, FileMetadataDifferencePattern, FileDifferenceKind, StandardOutput
 
 
 def archive_indexer():
@@ -22,16 +22,16 @@ def archive_indexer():
         else:
             archive_path = os.getcwd()
 
-    tracker = Tracker()
+    output = StandardOutput()
     if args.verbose:
-        tracker.verbosity = 1
+        output.verbosity = 1
 
     with Processor() as processor:
-        with Archive(processor, archive_path, tracker=tracker) as archive:
+        with Archive(processor, archive_path, output=output) as archive:
             if args.subcommand == 'rebuild':
                 archive.rebuild()
-            elif args.subcommand == 'filter':
-                _filter(archive, args.arguments)
+            elif args.subcommand == 'find-duplicates':
+                _find_duplicates(archive, args.arguments)
             elif args.subcommand == 'inspect':
                 for record in archive.inspect():
                     print(record)
@@ -40,14 +40,13 @@ def archive_indexer():
                 sys.exit(1)
 
 
-def _filter(archive: Archive, arguments):
+def _find_duplicates(archive: Archive, arguments):
     parser = argparse.ArgumentParser()
     parser.add_argument('--ignore')
-    parser.add_argument('input')
-    parser.add_argument('output')
+    parser.add_argument('file_or_directory', nargs='*')
     args = parser.parse_args(arguments)
 
-    diffptn = IgnoredFileDifferencePattern()
+    diffptn = FileMetadataDifferencePattern()
     if args.ignore:
         for kind in args.ignore.split(','):
             kind = kind.strip()
@@ -58,7 +57,8 @@ def _filter(archive: Archive, arguments):
     else:
         diffptn.ignore_trivial_attributes()
 
-    archive.filter(Path(args.input), Path(args.output), ignore=diffptn)
+    for file_or_directory in args.file_or_directory:
+        archive.find_duplicates(Path(file_or_directory), ignore=diffptn)
 
 
 if __name__ == '__main__':

@@ -13,7 +13,11 @@ def compute_sha256_for_path(path: pathlib.Path):
         return hashlib.file_digest(f, hashlib.sha256).digest()
 
 
-def compare_files_with_paths(a: pathlib.Path, b: pathlib.Path):
+def compare_file_content(a: pathlib.Path, b: pathlib.Path):
+    return filecmp.cmp(a, b, shallow=False)
+
+
+def compare_file_metadata(a: pathlib.Path, b: pathlib.Path):
     sta = a.stat(follow_symlinks=False)
     stb = b.stat(follow_symlinks=False)
 
@@ -24,10 +28,6 @@ def compare_files_with_paths(a: pathlib.Path, b: pathlib.Path):
         raise ValueError(f"{b} is not a regular file")
 
     diffs = []
-
-    if not filecmp.cmp(a, b, shallow=False):
-        diffs.append(('content', None, None))
-        return diffs
 
     if sta.st_atime != stb.st_atime or sta.st_atime_ns != stb.st_atime_ns:
         diffs.append(('atime', sta.st_atime_ns, stb.st_atime_ns))
@@ -69,8 +69,14 @@ class Processor:
     def sha256(self, path: pathlib.Path) -> Awaitable[bytes]:
         return self._evaluate(compute_sha256_for_path, path)
 
-    def compare(self, a: pathlib.Path, b: pathlib.Path) -> Awaitable[list[tuple[str, any, any]]]:
-        return self._evaluate(compare_files_with_paths, a, b)
+    def compare_content(self, a: pathlib.Path, b: pathlib.Path) -> Awaitable[bool]:
+        """Compare content of two files.
+
+        :return: True if two files are equal, False otherwise."""
+        return self._evaluate(compare_file_content, a, b)
+
+    def compare_metadata(self, a: pathlib.Path, b: pathlib.Path) -> Awaitable[list[tuple[str, any, any]]]:
+        return self._evaluate(compare_file_metadata, a, b)
 
     def _evaluate(self, func, *args):
         loop = asyncio.get_running_loop()
