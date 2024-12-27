@@ -10,8 +10,19 @@ def archive_indexer():
     parser = argparse.ArgumentParser()
     parser.add_argument('--archive')
     parser.add_argument('--verbose', action='store_true')
-    parser.add_argument('subcommand')
-    parser.add_argument('arguments', nargs='*')
+    subparsers = parser.add_subparsers()
+
+    parser_find_duplicates = subparsers.add_parser('rebuild')
+    parser_find_duplicates.set_defaults(method=lambda a, _1, _2: a.rebuild())
+
+    parser_find_duplicates = subparsers.add_parser('find-duplicates')
+    parser_find_duplicates.add_argument('--ignore')
+    parser_find_duplicates.add_argument('--show-possible-duplicates', action='store_true')
+    parser_find_duplicates.add_argument('file_or_directory', nargs='*')
+    parser_find_duplicates.set_defaults(method=_find_duplicates)
+
+    parser_find_duplicates = subparsers.add_parser('inspect')
+    parser_find_duplicates.set_defaults(method=lambda a, _1, _2: a.inspect())
 
     args = parser.parse_args()
 
@@ -28,24 +39,10 @@ def archive_indexer():
 
     with Processor() as processor:
         with Archive(processor, archive_path, output=output) as archive:
-            if args.subcommand == 'rebuild':
-                archive.rebuild()
-            elif args.subcommand == 'find-duplicates':
-                _find_duplicates(archive, args.arguments)
-            elif args.subcommand == 'inspect':
-                for record in archive.inspect():
-                    print(record)
-            else:
-                print(f'Unknown subcommand: {args.subcommand}', file=sys.stderr)
-                sys.exit(1)
+            args.method(archive, output, args)
 
 
-def _find_duplicates(archive: Archive, arguments):
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--ignore')
-    parser.add_argument('file_or_directory', nargs='*')
-    args = parser.parse_args(arguments)
-
+def _find_duplicates(archive: Archive, output: StandardOutput, args):
     diffptn = FileMetadataDifferencePattern()
     if args.ignore:
         for kind in args.ignore.split(','):
@@ -57,8 +54,15 @@ def _find_duplicates(archive: Archive, arguments):
     else:
         diffptn.ignore_trivial_attributes()
 
-    for file_or_directory in args.file_or_directory:
-        archive.find_duplicates(Path(file_or_directory), ignore=diffptn)
+    saved_showing_possible_duplicates = output.showing_possible_duplicates
+    try:
+        if args.show_possible_duplicates:
+            output.showing_possible_duplicates = True
+
+        for file_or_directory in args.file_or_directory:
+            archive.find_duplicates(Path(file_or_directory), ignore=diffptn)
+    finally:
+        output.showing_possible_duplicates = saved_showing_possible_duplicates
 
 
 if __name__ == '__main__':

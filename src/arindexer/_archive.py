@@ -147,6 +147,7 @@ class FileHandle:
 class Output(metaclass=abc.ABCMeta):
     def __init__(self):
         self.verbosity = 0
+        self.showing_possible_duplicates = False
 
     @abc.abstractmethod
     def _produce(self, record: list[str]):
@@ -163,20 +164,20 @@ class Output(metaclass=abc.ABCMeta):
         self._produce(record)
 
     def produce_possible_duplicate(self, path, candidate, major_diffs, diffs):
-        if self.verbosity >= 2:
-            record = [
-                f'# possible duplicate: {str(path)}',
-                f"## file with identical content: {candidate}"
-            ]
+        if self.showing_possible_duplicates:
+            record = [f'# possible duplicate: {str(path)}']
 
-            for diff in major_diffs:
-                record.append(f"## difference - {diff[0]}: {diff[1]} != {diff[2]}")
+            if self.verbosity >= 1:
+                record.append(f"## file with identical content: {candidate}")
 
-            for diff in diffs:
-                if diff in major_diffs:
-                    continue
+                for diff in major_diffs:
+                    record.append(f"## difference - {diff[0]}: {diff[1]} != {diff[2]}")
 
-                record.append(f"## ignored difference - {diff[0]}: {diff[1]} != {diff[2]}")
+                for diff in diffs:
+                    if diff in major_diffs:
+                        continue
+
+                    record.append(f"## ignored difference - {diff[0]}: {diff[1]} != {diff[2]}")
 
             self._produce(record)
 
@@ -327,15 +328,14 @@ class Archive:
                                 equivalent = candidate
                                 break
                             else:
-                                self._output.produce_possible_duplicate(
-                                    handle.relative_path(), candidate, major_diffs, diffs)
+                                self._output.produce_possible_duplicate(path, candidate, major_diffs, diffs)
                         else:
                             continue
                         break
                 else:
                     return
 
-                self._output.produce_duplicate(handle.relative_path(), equivalent, diffs)
+                self._output.produce_duplicate(path, equivalent, diffs)
 
             for path, handle in self._walk(input):
                 if path.is_dir():

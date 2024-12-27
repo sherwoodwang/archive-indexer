@@ -160,19 +160,22 @@ class ArchiveTest(unittest.TestCase):
                     diffptn.ignore(FileDifferenceKind.CTIME)
                     diffptn.ignore(FileDifferenceKind.MTIME)
                     archive.find_duplicates(target, ignore=diffptn)
-                    self.assertEqual(set((tuple(r) for r in output.data)), {('sample-a',), ('sample-b',)})
+                    self.assertEqual(
+                        set((tuple(r) for r in output.data)),
+                        {(f'{target}/sample-a',), (f'{target}/sample-b',)}
+                    )
 
                     output.data.clear()
                     output.verbosity = 1
                     archive.find_duplicates(target, ignore=diffptn)
                     self.assertEqual(
                         set((tuple((re.sub('^(##[^:]*):.*', '\\1', p) for p in r)) for r in output.data)),
-                        {('sample-a',
+                        {(f'{target}/sample-a',
                           '## identical file',
                           '## ignored difference - atime',
                           '## ignored difference - ctime',
                           '## ignored difference - mtime'),
-                         ('sample-b',
+                         (f'{target}/sample-b',
                           '## identical file',
                           '## ignored difference - atime',
                           '## ignored difference - ctime',
@@ -189,12 +192,12 @@ class ArchiveTest(unittest.TestCase):
                     archive.find_duplicates(target)
                     self.assertEqual(
                         set((tuple((re.sub('^(##[^:]*):.*', '\\1', p) for p in r)) for r in output.data)),
-                        {('# possible duplicate: sample-a',
+                        {(f'# possible duplicate: {target}/sample-a',
                           '## file with identical content',
                           '## difference - atime',
                           '## difference - ctime',
                           '## difference - mtime'),
-                         ('# possible duplicate: sample-b',
+                         (f'# possible duplicate: {target}/sample-b',
                           '## file with identical content',
                           '## difference - atime',
                           '## difference - ctime',
