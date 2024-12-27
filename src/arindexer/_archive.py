@@ -2,6 +2,8 @@ import asyncio
 import os
 import stat
 from asyncio import TaskGroup, Semaphore
+from enum import StrEnum
+from os import major
 from pathlib import Path
 from typing import Iterator
 
@@ -30,6 +32,29 @@ class Throttler:
         except:
             self._semaphore.release()
             raise
+
+
+class FileDifferenceKind(StrEnum):
+    CONTENT = 'content'
+    ATIME = 'atime'
+    CTIME = 'ctime'
+    MTIME = 'mtime'
+    BIRTHTIME = 'birthtime'
+
+
+class IgnoredFileDifferencePattern:
+    def __init__(self):
+        self._ignored_patterns: set[FileDifferenceKind] = set()
+
+    def ignore_trivial_attributes(self):
+        self.ignore(FileDifferenceKind.ATIME)
+        self.ignore(FileDifferenceKind.CTIME)
+
+    def ignore(self, kind: FileDifferenceKind):
+        self._ignored_patterns.add(kind)
+
+    def is_ignored(self, diff_desc: tuple[str, any, any]) -> bool:
+        return FileDifferenceKind(diff_desc[0]) in self._ignored_patterns
 
 
 class FileHandle:
@@ -77,13 +102,17 @@ class Tracker:
     def __init__(self):
         self.verbosity = 0
 
-    def log_skipping(self, path, equivalent):
+    def log_skipping(self, path, equivalent, diffs):
         if self.verbosity >= 1:
-            print(f"skipping: {path}\n\tidentical file: {equivalent}")
+            print(f"skipping: {path}")
+            print(f"\tidentical file: {equivalent}")
+            for diff in diffs:
+                print(f"\tignored difference: {diff[0]} {diff[1]} != {diff[2]}")
 
     def log_keeping(self, path: Path):
         if self.verbosity >= 1:
             print(f"keeping: {path}")
+
 
 class Archive:
     __CONFIG_PREFIX = b'c:'
@@ -168,10 +197,13 @@ class Archive:
 
         self._write_config(Archive.__CONFIG_HASH_ALGORITHM, 'sha256')
 
-    def filter(self, input: Path, output: Path):
-        asyncio.run(self._do_filter(input, output))
+    def filter(self, input: Path, output: Path, ignore: IgnoredFileDifferencePattern | None = None):
+        asyncio.run(self._do_filter(input, output, ignore=ignore))
 
-    async def _do_filter(self, input: Path, output: Path):
+    async def _do_filter(self, input: Path, output: Path, ignore: IgnoredFileDifferencePattern | None):
+        if ignore is None:
+            ignore = IgnoredFileDifferencePattern()
+
         if output.exists():
             raise FileExistsError(f"File {output} already exists")
 
@@ -190,8 +222,10 @@ class Archive:
                 digest = await self._processor.sha256(path)
                 for candidate in self._lookup_file(digest):
                     candidate = Path(*candidate)
-                    if await self._processor.compare(self._archive_path / candidate, path):
-                        self._tracker.log_skipping(handle.relative_path(), candidate)
+                    diffs = await self._processor.compare(self._archive_path / candidate, path)
+                    major_diffs = [diff for diff in diffs if not ignore.is_ignored(diff)]
+                    if not major_diffs:
+                        self._tracker.log_skipping(handle.relative_path(), candidate, diffs)
                         break
                 else:
                     (output / handle.relative_path()).hardlink_to(path)

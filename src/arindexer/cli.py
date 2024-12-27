@@ -3,7 +3,7 @@ import os
 import sys
 from pathlib import Path
 
-from . import Archive, Processor, Tracker
+from . import Archive, Processor, Tracker, IgnoredFileDifferencePattern, FileDifferenceKind
 
 
 def archive_indexer():
@@ -37,13 +37,25 @@ def archive_indexer():
                 sys.exit(1)
 
 
-def _filter(archive, arguments):
+def _filter(archive: Archive, arguments):
     parser = argparse.ArgumentParser()
+    parser.add_argument('--ignore')
     parser.add_argument('input')
     parser.add_argument('output')
     args = parser.parse_args(arguments)
 
-    archive.filter(Path(args.input), Path(args.output))
+    diffptn = IgnoredFileDifferencePattern()
+    if args.ignore:
+        for kind in args.ignore.split(','):
+            kind = kind.strip()
+            if not kind:
+                continue
+
+            diffptn.ignore(FileDifferenceKind(kind))
+    else:
+        diffptn.ignore_trivial_attributes()
+
+    archive.filter(Path(args.input), Path(args.output), ignore=diffptn)
 
 
 if __name__ == '__main__':

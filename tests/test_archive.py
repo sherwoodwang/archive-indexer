@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from arindexer import Archive
+from arindexer import Archive, IgnoredFileDifferencePattern, FileDifferenceKind
 # noinspection PyProtectedMember
 from arindexer._processor import Processor
 
@@ -51,7 +51,11 @@ class ArchiveTest(unittest.TestCase):
                 generate(target / 'retained', 'retained')
 
                 with Archive(processor, str(archive_path)) as archive:
-                    archive.filter(target, target_filtered)
+                    diffptn = IgnoredFileDifferencePattern()
+                    diffptn.ignore(FileDifferenceKind.ATIME)
+                    diffptn.ignore(FileDifferenceKind.CTIME)
+                    diffptn.ignore(FileDifferenceKind.MTIME)
+                    archive.filter(target, target_filtered, ignore=diffptn)
 
                     self.assertTrue((target_filtered / 'retained').exists())
                     self.assertFalse((target_filtered / 'sample-a').exists())

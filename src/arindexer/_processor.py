@@ -3,6 +3,7 @@ import filecmp
 import hashlib
 import multiprocessing
 import pathlib
+import stat
 from typing import Awaitable
 
 
@@ -13,7 +14,35 @@ def compute_sha256_for_path(path: pathlib.Path):
 
 
 def compare_files_with_paths(a: pathlib.Path, b: pathlib.Path):
-    return filecmp.cmp(a, b, shallow=False)
+    sta = a.stat(follow_symlinks=False)
+    stb = b.stat(follow_symlinks=False)
+
+    if not stat.S_ISREG(sta.st_mode):
+        raise ValueError(f"{a} is not a regular file")
+
+    if not stat.S_ISREG(stb.st_mode):
+        raise ValueError(f"{b} is not a regular file")
+
+    diffs = []
+
+    if not filecmp.cmp(a, b, shallow=False):
+        diffs.append(('content', None, None))
+        return diffs
+
+    if sta.st_atime != stb.st_atime or sta.st_atime_ns != stb.st_atime_ns:
+        diffs.append(('atime', sta.st_atime_ns, stb.st_atime_ns))
+
+    if sta.st_ctime != stb.st_ctime or sta.st_ctime_ns != stb.st_ctime_ns:
+        diffs.append(('ctime', sta.st_ctime_ns, stb.st_ctime_ns))
+
+    if sta.st_mtime != stb.st_mtime or sta.st_mtime_ns != stb.st_mtime_ns:
+        diffs.append(('mtime', sta.st_mtime_ns, stb.st_mtime_ns))
+
+    if hasattr(sta, "st_birthtime") and hasattr(stb, "st_birthtime"):
+        if sta.st_birthtime != stb.st_birthtime:
+            diffs.append(('birthtime', sta.st_birthtime, stb.st_birthtime))
+
+    return diffs
 
 
 class Processor:
@@ -40,7 +69,7 @@ class Processor:
     def sha256(self, path: pathlib.Path) -> Awaitable[bytes]:
         return self._evaluate(compute_sha256_for_path, path)
 
-    def compare(self, a: pathlib.Path, b: pathlib.Path) -> Awaitable[bytes]:
+    def compare(self, a: pathlib.Path, b: pathlib.Path) -> Awaitable[list[tuple[str, any, any]]]:
         return self._evaluate(compare_files_with_paths, a, b)
 
     def _evaluate(self, func, *args):
