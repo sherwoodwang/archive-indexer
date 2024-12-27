@@ -1,4 +1,5 @@
 import hashlib
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -147,7 +148,7 @@ class ArchiveTest(unittest.TestCase):
                 class CollectingOutput(Output):
                     def __init__(self):
                         super().__init__()
-                        self.data = []
+                        self.data: list[list[str]] = []
 
                     def _produce(self, record):
                         self.data.append(record)
@@ -159,8 +160,46 @@ class ArchiveTest(unittest.TestCase):
                     diffptn.ignore(FileDifferenceKind.CTIME)
                     diffptn.ignore(FileDifferenceKind.MTIME)
                     archive.find_duplicates(target, ignore=diffptn)
+                    self.assertEqual(set((tuple(r) for r in output.data)), {('sample-a',), ('sample-b',)})
 
-                    self.assertEqual(set(output.data), {'sample-a', 'sample-b'})
+                    output.data.clear()
+                    output.verbosity = 1
+                    archive.find_duplicates(target, ignore=diffptn)
+                    self.assertEqual(
+                        set((tuple((re.sub('^(##[^:]*):.*', '\\1', p) for p in r)) for r in output.data)),
+                        {('sample-a',
+                          '## identical file',
+                          '## ignored difference - atime',
+                          '## ignored difference - ctime',
+                          '## ignored difference - mtime'),
+                         ('sample-b',
+                          '## identical file',
+                          '## ignored difference - atime',
+                          '## ignored difference - ctime',
+                          '## ignored difference - mtime')}
+                    )
+
+                    output.data.clear()
+                    output.verbosity = 1
+                    archive.find_duplicates(target)
+                    self.assertEqual(output.data, [])
+
+                    output.data.clear()
+                    output.verbosity = 2
+                    archive.find_duplicates(target)
+                    self.assertEqual(
+                        set((tuple((re.sub('^(##[^:]*):.*', '\\1', p) for p in r)) for r in output.data)),
+                        {('# possible duplicate: sample-a',
+                          '## file with identical content',
+                          '## difference - atime',
+                          '## difference - ctime',
+                          '## difference - mtime'),
+                         ('# possible duplicate: sample-b',
+                          '## file with identical content',
+                          '## difference - atime',
+                          '## difference - ctime',
+                          '## difference - mtime')}
+                    )
 
     def test_rebuild_with_collision(self):
         with tempfile.TemporaryDirectory() as tmpdir:

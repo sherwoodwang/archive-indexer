@@ -149,16 +149,36 @@ class Output(metaclass=abc.ABCMeta):
         self.verbosity = 0
 
     @abc.abstractmethod
-    def _produce(self, record):
+    def _produce(self, record: list[str]):
         raise NotImplementedError()
 
     def produce_duplicate(self, path, equivalent, diffs):
-        self._produce(str(path))
+        record = [str(path)]
 
         if self.verbosity >= 1:
-            self._produce(f"# identical file: {equivalent}")
+            record.append(f"## identical file: {equivalent}")
             for diff in diffs:
-                self._produce(f"# ignored difference: {diff[0]} {diff[1]} != {diff[2]}")
+                record.append(f"## ignored difference - {diff[0]}: {diff[1]} != {diff[2]}")
+
+        self._produce(record)
+
+    def produce_possible_duplicate(self, path, candidate, major_diffs, diffs):
+        if self.verbosity >= 2:
+            record = [
+                f'# possible duplicate: {str(path)}',
+                f"## file with identical content: {candidate}"
+            ]
+
+            for diff in major_diffs:
+                record.append(f"## difference - {diff[0]}: {diff[1]} != {diff[2]}")
+
+            for diff in diffs:
+                if diff in major_diffs:
+                    continue
+
+                record.append(f"## ignored difference - {diff[0]}: {diff[1]} != {diff[2]}")
+
+            self._produce(record)
 
 
 class StandardOutput(Output):
@@ -166,7 +186,8 @@ class StandardOutput(Output):
         super().__init__()
 
     def _produce(self, record):
-        print(record)
+        for part in record:
+            print(part)
 
 
 class Archive:
@@ -305,6 +326,9 @@ class Archive:
                             if not major_diffs:
                                 equivalent = candidate
                                 break
+                            else:
+                                self._output.produce_possible_duplicate(
+                                    handle.relative_path(), candidate, major_diffs, diffs)
                         else:
                             continue
                         break
