@@ -323,7 +323,7 @@ class Archive:
                     # TODO
                     pass
 
-    def inspect(self):
+    def inspect(self) -> Iterator[str]:
         hash_algorithm = self._read_config(Archive.__CONFIG_HASH_ALGORITHM)
         if hash_algorithm in self._hash_algorithms:
             hash_length, _ = self._hash_algorithms[hash_algorithm]
@@ -334,7 +334,7 @@ class Archive:
             key: bytes
             if key.startswith(Archive.__CONFIG_PREFIX):
                 entry = key[len(Archive.__CONFIG_PREFIX):].decode()
-                print('config', entry, value.decode())
+                yield f'config {entry} {value.decode()}'
             elif key.startswith(Archive.__FILE_HASH_PREFIX):
                 digest_and_ec_id = key[len(Archive.__FILE_HASH_PREFIX):]
                 paths = ' '.join((
@@ -343,12 +343,12 @@ class Archive:
                 if hash_length is not None:
                     hex_digest = digest_and_ec_id[:hash_length].hex()
                     ec_id = int.from_bytes(digest_and_ec_id[hash_length:])
-                    print('file-hash', hex_digest, ec_id, paths)
+                    yield f'file-hash {hex_digest} {ec_id} {paths}'
                 else:
                     hex_digest_and_ec_id = digest_and_ec_id.hex()
-                    print('file-hash', '*' + hex_digest_and_ec_id, paths)
+                    yield f'file-hash *{hex_digest_and_ec_id} {paths}'
             else:
-                print('OTHER', key, value)
+                yield f'OTHER {key} {value}'
 
     def _truncate(self):
         self._write_config(Archive.__CONFIG_HASH_ALGORITHM, None)

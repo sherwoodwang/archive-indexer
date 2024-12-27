@@ -32,6 +32,9 @@ def archive_indexer():
                 archive.rebuild()
             elif args.subcommand == 'filter':
                 _filter(archive, args.arguments)
+            elif args.subcommand == 'inspect':
+                for record in archive.inspect():
+                    print(record)
             else:
                 print(f'Unknown subcommand: {args.subcommand}', file=sys.stderr)
                 sys.exit(1)
