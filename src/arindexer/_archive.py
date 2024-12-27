@@ -1,11 +1,11 @@
 import asyncio
 import os
 import stat
-from asyncio import TaskGroup, Semaphore
+import urllib.parse
+from asyncio import TaskGroup, Semaphore, Lock, Condition
 from enum import StrEnum
-from os import major
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Iterable
 
 import msgpack
 import plyvel
@@ -34,6 +34,40 @@ class Throttler:
             raise
 
 
+class LockTable:
+    class _Lock:
+        def __init__(self, parent, entry):
+            self._parent: LockTable = parent
+            self._entry = entry
+
+        async def __aenter__(self):
+            async with self._parent._lock:
+                if self._entry in self._parent._entries:
+                    self._parent._entries[self._entry].append(self)
+                else:
+                    self._parent._entries[self._entry] = [self]
+
+                while self._parent._entries[self._entry][0] is not self:
+                    await self._parent._entry_releasing.wait()
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            async with self._parent._lock:
+                backlog = self._parent._entries[self._entry]
+                if len(backlog) > 1:
+                    self._parent._entries[self._entry] = backlog[1:]
+                    self._parent._entry_releasing.notify_all()
+                else:
+                    del self._parent._entries[self._entry]
+
+    def __init__(self):
+        self._lock = Lock()
+        self._entry_releasing = Condition(self._lock)
+        self._entries = dict()
+
+    def lock(self, entry):
+        return LockTable._Lock(self, entry)
+
+
 class FileDifferenceKind(StrEnum):
     CONTENT = 'content'
     ATIME = 'atime'
@@ -50,11 +84,29 @@ class IgnoredFileDifferencePattern:
         self.ignore(FileDifferenceKind.ATIME)
         self.ignore(FileDifferenceKind.CTIME)
 
+    def ignore_all_except_content(self):
+        for kind in FileDifferenceKind:
+            kind: FileDifferenceKind
+            if kind == FileDifferenceKind.CONTENT:
+                continue
+
+            self.ignore(kind)
+
     def ignore(self, kind: FileDifferenceKind):
+        if kind == FileDifferenceKind.CONTENT:
+            raise ValueError()
+
         self._ignored_patterns.add(kind)
 
     def is_ignored(self, diff_desc: tuple[str, any, any]) -> bool:
         return FileDifferenceKind(diff_desc[0]) in self._ignored_patterns
+
+    def filter(self, diffs: Iterable[tuple[str, any, any]]) -> list[tuple[str, any, any]]:
+        return [diff for diff in diffs if not self.is_ignored(diff)]
+
+
+IgnoredFileDifferencePattern.ALL_EXCEPT_CONTENT = IgnoredFileDifferencePattern()
+IgnoredFileDifferencePattern.ALL_EXCEPT_CONTENT.ignore_all_except_content()
 
 
 class FileHandle:
@@ -155,6 +207,11 @@ class Archive:
         self._config_database = config_database
         self._file_hash_database = file_hash_database
 
+        self._hash_algorithms = {
+            'sha256': (32, self._processor.sha256)
+        }
+        self._default_hash_algorithm = 'sha256'
+
     def __del__(self):
         self.close()
 
@@ -185,8 +242,26 @@ class Archive:
         async with TaskGroup() as tg:
             throttler = Throttler(tg, self._processor.concurrency * 2)
 
+            lock_table = LockTable()
+
+            _, calculate_digest = self._hash_algorithms[self._default_hash_algorithm]
+
             async def handle_file(path: Path, handle: FileHandle):
-                self._register_file(handle, await self._processor.sha256(path))
+                digest = await calculate_digest(path)
+
+                async with lock_table.lock(digest):
+                    next_ec_id = 0
+                    for ec_id, paths in self._lookup_file_equivalents(digest):
+                        if next_ec_id <= ec_id:
+                            next_ec_id = ec_id + 1
+
+                        if not IgnoredFileDifferencePattern.ALL_EXCEPT_CONTENT.filter(
+                                await self._processor.compare(path, self._archive_path / paths[0])):
+                            paths.append(handle.relative_path())
+                            self._register_file_equivalents(digest, ec_id, paths)
+                            break
+                    else:
+                        self._register_file_equivalents(digest, next_ec_id, [handle.relative_path()])
 
             for path, handle in self._walk_archive():
                 if handle.is_file():
@@ -195,7 +270,7 @@ class Archive:
                     # TODO
                     pass
 
-        self._write_config(Archive.__CONFIG_HASH_ALGORITHM, 'sha256')
+        self._write_config(Archive.__CONFIG_HASH_ALGORITHM, self._default_hash_algorithm)
 
     def filter(self, input: Path, output: Path, ignore: IgnoredFileDifferencePattern | None = None):
         asyncio.run(self._do_filter(input, output, ignore=ignore))
@@ -212,20 +287,21 @@ class Archive:
         if hash_algorithm is None:
             raise RuntimeError("The index hasn't been build")
 
-        if hash_algorithm != 'sha256':
+        if hash_algorithm not in self._hash_algorithms:
             raise RuntimeError(f"Unknown hash algorithm: {hash_algorithm}")
 
         async with TaskGroup() as tg:
             throttler = Throttler(tg, self._processor.concurrency * 2)
 
+            _, calculate_digest = self._hash_algorithms[self._default_hash_algorithm]
+
             async def handle_file(path: Path, handle: FileHandle):
-                digest = await self._processor.sha256(path)
-                for candidate in self._lookup_file(digest):
-                    candidate = Path(*candidate)
-                    diffs = await self._processor.compare(self._archive_path / candidate, path)
+                digest = await calculate_digest(path)
+                for ec_id, paths in self._lookup_file_equivalents(digest):
+                    diffs = await self._processor.compare(self._archive_path / paths[0], path)
                     major_diffs = [diff for diff in diffs if not ignore.is_ignored(diff)]
                     if not major_diffs:
-                        self._tracker.log_skipping(handle.relative_path(), candidate, diffs)
+                        self._tracker.log_skipping(handle.relative_path(), paths[0], diffs)
                         break
                 else:
                     (output / handle.relative_path()).hardlink_to(path)
@@ -248,14 +324,29 @@ class Archive:
                     pass
 
     def inspect(self):
+        hash_algorithm = self._read_config(Archive.__CONFIG_HASH_ALGORITHM)
+        if hash_algorithm in self._hash_algorithms:
+            hash_length, _ = self._hash_algorithms[hash_algorithm]
+        else:
+            hash_length = None
+
         for key, value in self._database.iterator():
             key: bytes
             if key.startswith(Archive.__CONFIG_PREFIX):
                 entry = key[len(Archive.__CONFIG_PREFIX):].decode()
                 print('config', entry, value.decode())
             elif key.startswith(Archive.__FILE_HASH_PREFIX):
-                hex_digest = key[len(Archive.__FILE_HASH_PREFIX):].hex()
-                print('file-hash', hex_digest, msgpack.loads(value))
+                digest_and_ec_id = key[len(Archive.__FILE_HASH_PREFIX):]
+                paths = ' '.join((
+                    '/'.join((urllib.parse.quote_plus(part) for part in path))
+                    for path in msgpack.loads(value)))
+                if hash_length is not None:
+                    hex_digest = digest_and_ec_id[:hash_length].hex()
+                    ec_id = int.from_bytes(digest_and_ec_id[hash_length:])
+                    print('file-hash', hex_digest, ec_id, paths)
+                else:
+                    hex_digest_and_ec_id = digest_and_ec_id.hex()
+                    print('file-hash', '*' + hex_digest_and_ec_id, paths)
             else:
                 print('OTHER', key, value)
 
@@ -282,20 +373,18 @@ class Archive:
 
         return value
 
-    def _register_file(self, handle: FileHandle, digest: bytes) -> None:
-        current = self._lookup_file(digest)
-        current.append([str(part) for part in handle.relative_path().parts])
-        data = msgpack.dumps(current)
-        self._file_hash_database.put(digest, data)
+    def _register_file_equivalents(self, digest: bytes, ec_id: int, paths: list[Path]) -> None:
+        data = [[str(part) for part in path.parts] for path in paths]
+        data.sort()
+        data = msgpack.dumps(data)
+        self._file_hash_database.put(digest + ec_id.to_bytes(length=4).lstrip(b'\0'), data)
 
-    def _lookup_file(self, digest: bytes) -> list[list[str]]:
-        data = self._file_hash_database.get(digest)
-        if data is None:
-            current = []
-        else:
-            current = msgpack.loads(data)
-
-        return current
+    def _lookup_file_equivalents(self, digest: bytes) -> Iterable[tuple[int, list[Path]]]:
+        ec_db: plyvel.DB = self._file_hash_database.prefixed_db(digest)
+        for key, data in ec_db.iterator():
+            ec_id = int.from_bytes(key)
+            data: list[list[str]] = msgpack.loads(data)
+            yield ec_id, [Path(*parts) for parts in data]
 
     def _walk_archive(self) -> Iterator[tuple[Path, FileHandle]]:
         handle = FileHandle(None, None, self._archive_path.stat())

@@ -8,8 +8,26 @@ from arindexer import Archive, IgnoredFileDifferencePattern, FileDifferenceKind
 from arindexer._processor import Processor
 
 
+async def compute_xor(path: Path):
+    data = path.read_bytes()
+    value = 0
+    while data:
+        if len(data) > 4:
+            seg = data[:4]
+            data = data[4:]
+        else:
+            seg = (data + b'\0\0\0\0')[:4]
+            data = b''
+
+        value = value ^ int.from_bytes(seg)
+
+    value = int.to_bytes(value, length=4)
+
+    return value
+
+
 class ArchiveTest(unittest.TestCase):
-    def test_simple_rebuild(self):
+    def test_rebuild_and_filter(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             archive_path = Path(tmpdir) / 'test_archive'
             archive_path.mkdir()
@@ -36,6 +54,9 @@ class ArchiveTest(unittest.TestCase):
             (archive_path / 'sample8').mkdir()
             for i in range(9, 9 + 64):
                 generate(archive_path / 'sample8' / f'sample{i}', f'sample{i}')
+            (archive_path / 'sample74').mkdir()
+            for i in range(9, 9 + 16):
+                generate(archive_path / 'sample74' / f'sample{i}-another', f'sample{i}')
 
             with Processor() as processor:
                 with Archive(processor, str(archive_path)) as archive:
@@ -60,6 +81,25 @@ class ArchiveTest(unittest.TestCase):
                     self.assertTrue((target_filtered / 'retained').exists())
                     self.assertFalse((target_filtered / 'sample-a').exists())
                     self.assertFalse((target_filtered / 'sample-b').exists())
+
+    def test_rebuild_with_collision(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            archive_path = Path(tmpdir) / 'test_archive'
+            archive_path.mkdir()
+
+            (archive_path / 'sample0').write_bytes(b'\0\0\0\0\1\1\1\1')
+            (archive_path / 'sample1').write_bytes(b'\1\1\1\1\2\2\2\2')
+            for i in range(2, 300):
+                (archive_path / f'sample{i}').write_bytes(
+                    (i * 2).to_bytes(length=2) * 2 + (i * 2 + 1).to_bytes(length=2) * 2)
+
+            with Processor() as processor:
+                with Archive(processor, str(archive_path)) as archive:
+                    archive._hash_algorithms['xor'] = (4, compute_xor)
+                    archive._default_hash_algorithm = 'xor'
+
+                    archive.rebuild()
+                    archive.inspect()
 
 
 if __name__ == '__main__':
