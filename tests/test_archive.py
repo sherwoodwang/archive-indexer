@@ -64,7 +64,6 @@ class ArchiveTest(unittest.TestCase):
                     archive.rebuild()
                     archive.rebuild()
                     self.assertEqual(
-                        set(archive.inspect()),
                         {
                             'config hash-algorithm sha256',
                             'file-hash 012e06abd2e40aebd85e416c4c84d0409e131e7831b10fae1944972d01c03753 0 sample8/sample41',
@@ -135,7 +134,8 @@ class ArchiveTest(unittest.TestCase):
                             'file-hash f72073aa85c5e441ade232bc7123ce1a220062bfa1e2227f9d285139a8344163 0 sample74/sample23-another sample8/sample23',
                             'file-hash fa2ff5ac7b6ebe8c10c5bac5a0c84f59cead8405f1e5e6006f026fcdb7976209 0 sample8/sample62',
                             'file-hash fff29af91fad946f0cca38161a5081880386d14091a405a3d96dc66522e44f78 0 sample74/sample21-another sample8/sample21',
-                        }
+                        },
+                        set(archive.inspect())
                     )
 
                 target = Path(tmpdir) / 'target'
@@ -161,15 +161,14 @@ class ArchiveTest(unittest.TestCase):
                     diffptn.ignore(FileDifferenceKind.MTIME)
                     archive.find_duplicates(target, ignore=diffptn)
                     self.assertEqual(
-                        set((tuple(r) for r in output.data)),
-                        {(f'{target}/sample-a',), (f'{target}/sample-b',)}
+                        {(f'{target}/sample-a',), (f'{target}/sample-b',)},
+                        set((tuple(r) for r in output.data))
                     )
 
                     output.data.clear()
                     output.verbosity = 1
                     archive.find_duplicates(target, ignore=diffptn)
                     self.assertEqual(
-                        set((tuple((re.sub('^(##[^:]*):.*', '\\1', p) for p in r)) for r in output.data)),
                         {(f'{target}/sample-a',
                           '## identical file',
                           '## ignored difference - atime',
@@ -179,19 +178,20 @@ class ArchiveTest(unittest.TestCase):
                           '## identical file',
                           '## ignored difference - atime',
                           '## ignored difference - ctime',
-                          '## ignored difference - mtime')}
+                          '## ignored difference - mtime')},
+                        set((tuple((re.sub('^(##[^:]*):.*', '\\1', p) for p in r)) for r in output.data))
                     )
 
                     output.data.clear()
                     output.verbosity = 1
                     archive.find_duplicates(target)
-                    self.assertEqual(output.data, [])
+                    self.assertEqual([], output.data)
 
                     output.data.clear()
-                    output.verbosity = 2
+                    output.verbosity = 1
+                    output.showing_possible_duplicates = True
                     archive.find_duplicates(target)
                     self.assertEqual(
-                        set((tuple((re.sub('^(##[^:]*):.*', '\\1', p) for p in r)) for r in output.data)),
                         {(f'# possible duplicate: {target}/sample-a',
                           '## file with identical content',
                           '## difference - atime',
@@ -201,7 +201,8 @@ class ArchiveTest(unittest.TestCase):
                           '## file with identical content',
                           '## difference - atime',
                           '## difference - ctime',
-                          '## difference - mtime')}
+                          '## difference - mtime')},
+                        set((tuple((re.sub('^(##[^:]*):.*', '\\1', p) for p in r)) for r in output.data)),
                     )
 
     def test_rebuild_with_collision(self):
@@ -223,7 +224,6 @@ class ArchiveTest(unittest.TestCase):
                     archive.rebuild()
 
                     self.assertEqual(
-                        set((rec for rec in archive.inspect())),
                         {
                             'config hash-algorithm xor',
                             'file-hash 00010001 0 sample130',
@@ -526,7 +526,8 @@ class ArchiveTest(unittest.TestCase):
                             'file-hash 00010001 255 sample201',
                             'file-hash 01010101 0 sample0',
                             'file-hash 03030303 0 sample1',
-                        }
+                        },
+                        set((rec for rec in archive.inspect()))
                     )
 
 
