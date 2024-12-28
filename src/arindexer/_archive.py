@@ -194,6 +194,7 @@ class StandardOutput(Output):
 class Archive:
     __CONFIG_PREFIX = b'c:'
     __FILE_HASH_PREFIX = b'h:'
+    __FILE_METADATA_PREFIX = b'm:'
 
     __CONFIG_HASH_ALGORITHM = 'hash-algorithm'
 
@@ -219,6 +220,7 @@ class Archive:
             database = plyvel.DB(str(database_path), create_if_missing=True)
             config_database: plyvel.DB = database.prefixed_db(Archive.__CONFIG_PREFIX)
             file_hash_database: plyvel.DB = database.prefixed_db(Archive.__FILE_HASH_PREFIX)
+            file_metadata_database: plyvel.DB = database.prefixed_db(Archive.__FILE_METADATA_PREFIX)
         except:
             if database is not None:
                 database.close()
@@ -231,6 +233,7 @@ class Archive:
         self._database = database
         self._config_database = config_database
         self._file_hash_database = file_hash_database
+        self._file_metadata_database = file_metadata_database
 
         self._hash_algorithms = {
             'sha256': (32, self._processor.sha256)
@@ -282,10 +285,14 @@ class Archive:
 
                         if await self._processor.compare_content(path, self._archive_path / paths[0]):
                             paths.append(handle.relative_path())
-                            self._register_file_equivalents(digest, ec_id, paths)
                             break
                     else:
-                        self._register_file_equivalents(digest, next_ec_id, [handle.relative_path()])
+                        ec_id = next_ec_id
+                        paths = [handle.relative_path()]
+
+                    self._register_file(handle.relative_path(), digest, handle.stat.st_mtime_ns, None)
+                    self._register_file_equivalents(digest, ec_id, paths)
+                    self._register_file(handle.relative_path(), digest, handle.stat.st_mtime_ns, ec_id)
 
             for path, handle in self._walk_archive():
                 if handle.is_file():
@@ -373,6 +380,15 @@ class Archive:
                 else:
                     hex_digest_and_ec_id = digest_and_ec_id.hex()
                     yield f'file-hash *{hex_digest_and_ec_id} {paths}'
+            elif key.startswith(Archive.__FILE_METADATA_PREFIX):
+                from datetime import datetime, timezone
+                path = Path(*[part.decode() for part in key[len(Archive.__FILE_METADATA_PREFIX):].split(b'\0')])
+                [digest, mtime, ec_id] = msgpack.loads(value)
+                quoted_path = '/'.join((urllib.parse.quote_plus(part) for part in path.parts))
+                hex_digest = digest.hex()
+                mtime_string = \
+                    datetime.fromtimestamp(mtime / 1000000000, timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+                yield f'file-metadata {quoted_path} digest:{hex_digest} mtime:{mtime_string} ec_id:{ec_id}'
             else:
                 yield f'OTHER {key} {value}'
 
@@ -398,6 +414,12 @@ class Archive:
             value = value.decode()
 
         return value
+
+    def _register_file(self, path, digest, mtime_ns: int, ec_id: int | None) -> None:
+        self._file_metadata_database.put(
+            b'\0'.join((str(part).encode() for part in path.parts)),
+            msgpack.dumps([digest, mtime_ns, ec_id])
+        )
 
     def _register_file_equivalents(self, digest: bytes, ec_id: int, paths: list[Path]) -> None:
         data = [[str(part) for part in path.parts] for path in paths]

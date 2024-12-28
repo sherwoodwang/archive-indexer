@@ -1,6 +1,5 @@
 import argparse
 import os
-import sys
 from pathlib import Path
 
 from . import Archive, Processor, FileMetadataDifferencePattern, FileDifferenceKind, StandardOutput
