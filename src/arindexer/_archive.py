@@ -4,6 +4,7 @@ import os
 import stat
 import urllib.parse
 from asyncio import TaskGroup, Semaphore, Lock, Condition
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Iterator, Iterable
@@ -144,6 +145,13 @@ class FileHandle:
         return stat.S_ISREG(self.stat.st_mode)
 
 
+@dataclass
+class FileSignature:
+    digest: bytes
+    mtime_ns: int
+    ec_id: int | None
+
+
 class Output(metaclass=abc.ABCMeta):
     def __init__(self):
         self.verbosity = 0
@@ -194,9 +202,10 @@ class StandardOutput(Output):
 class Archive:
     __CONFIG_PREFIX = b'c:'
     __FILE_HASH_PREFIX = b'h:'
-    __FILE_METADATA_PREFIX = b'm:'
+    __FILE_SIGNATURE_PREFIX = b'm:'
 
     __CONFIG_HASH_ALGORITHM = 'hash-algorithm'
+    __CONFIG_PENDING_ACTION = 'truncating'
 
     def __init__(self, processor: Processor, path: str, output: Output | None = None):
         archive_path = Path(path)
@@ -220,7 +229,7 @@ class Archive:
             database = plyvel.DB(str(database_path), create_if_missing=True)
             config_database: plyvel.DB = database.prefixed_db(Archive.__CONFIG_PREFIX)
             file_hash_database: plyvel.DB = database.prefixed_db(Archive.__FILE_HASH_PREFIX)
-            file_metadata_database: plyvel.DB = database.prefixed_db(Archive.__FILE_METADATA_PREFIX)
+            file_signature_database: plyvel.DB = database.prefixed_db(Archive.__FILE_SIGNATURE_PREFIX)
         except:
             if database is not None:
                 database.close()
@@ -233,7 +242,7 @@ class Archive:
         self._database = database
         self._config_database = config_database
         self._file_hash_database = file_hash_database
-        self._file_metadata_database = file_metadata_database
+        self._file_signature_database = file_signature_database
 
         self._hash_algorithms = {
             'sha256': (32, self._processor.sha256)
@@ -266,15 +275,61 @@ class Archive:
 
     async def _do_rebuild(self):
         self._truncate()
+        await self._do_refresh(hash_algorithm=self._default_hash_algorithm)
+        self._write_config(Archive.__CONFIG_HASH_ALGORITHM, self._default_hash_algorithm)
 
+    def refresh(self):
+        asyncio.run(self._do_refresh())
+
+    async def _do_refresh(self, hash_algorithm: str | None = None):
         async with TaskGroup() as tg:
             throttler = Throttler(tg, self._processor.concurrency * 2)
-
             lock_table = LockTable()
 
-            _, calculate_digest = self._hash_algorithms[self._default_hash_algorithm]
+            if hash_algorithm is None:
+                hash_algorithm = self._read_config(Archive.__CONFIG_HASH_ALGORITHM)
+
+                if hash_algorithm is None:
+                    raise RuntimeError("The index hasn't been build")
+
+                if hash_algorithm not in self._hash_algorithms:
+                    raise RuntimeError(f"Unknown hash algorithm: {hash_algorithm}")
+
+            _, calculate_digest = self._hash_algorithms[hash_algorithm]
 
             async def handle_file(path: Path, handle: FileHandle):
+                if self._lookup_file(handle.relative_path()) is None:
+                    return await generate_signature(path, handle.relative_path(), handle.stat.st_mtime_ns)
+
+            async def refresh_entry(relative_path: Path, signature: FileSignature):
+                path = (self._archive_path / relative_path)
+
+                async def clean_up():
+                    self._register_file(relative_path, FileSignature(signature.digest, signature.mtime_ns, None))
+
+                    async with lock_table.lock(signature.digest):
+                        for ec_id, paths in self._lookup_file_equivalents(signature.digest):
+                            if relative_path in paths:
+                                paths.remove(relative_path)
+                                break
+                        else:
+                            ec_id = None
+
+                        if ec_id is not None:
+                            self._register_file_equivalents(signature.digest, ec_id, paths)
+
+                    self._deregister_file(relative_path)
+
+                try:
+                    stat = path.stat()
+                except FileNotFoundError:
+                    await clean_up()
+                else:
+                    if signature.mtime_ns is None or signature.mtime_ns < stat.st_mtime_ns:
+                        await clean_up()
+                        return await generate_signature(path, relative_path, stat.st_mtime_ns)
+
+            async def generate_signature(path: Path, relative_path: Path, mtime: int):
                 digest = await calculate_digest(path)
 
                 async with lock_table.lock(digest):
@@ -284,15 +339,18 @@ class Archive:
                             next_ec_id = ec_id + 1
 
                         if await self._processor.compare_content(path, self._archive_path / paths[0]):
-                            paths.append(handle.relative_path())
+                            paths.append(relative_path)
                             break
                     else:
                         ec_id = next_ec_id
-                        paths = [handle.relative_path()]
+                        paths = [relative_path]
 
-                    self._register_file(handle.relative_path(), digest, handle.stat.st_mtime_ns, None)
+                    self._register_file(relative_path, FileSignature(digest, mtime, None))
                     self._register_file_equivalents(digest, ec_id, paths)
-                    self._register_file(handle.relative_path(), digest, handle.stat.st_mtime_ns, ec_id)
+                    self._register_file(relative_path, FileSignature(digest, mtime, ec_id))
+
+            for path, signature in self._list_registered_files():
+                await throttler.schedule(refresh_entry(path, signature))
 
             for path, handle in self._walk_archive():
                 if handle.is_file():
@@ -300,8 +358,6 @@ class Archive:
                 else:
                     # TODO
                     pass
-
-        self._write_config(Archive.__CONFIG_HASH_ALGORITHM, self._default_hash_algorithm)
 
     def find_duplicates(self, input: Path, ignore: FileMetadataDifferencePattern | None = None):
         asyncio.run(self._do_find_duplicates(input, ignore=ignore))
@@ -320,7 +376,6 @@ class Archive:
 
         async with TaskGroup() as tg:
             throttler = Throttler(tg, self._processor.concurrency * 2)
-
             _, calculate_digest = self._hash_algorithms[self._default_hash_algorithm]
 
             async def handle_file(path: Path, handle: FileHandle):
@@ -380,9 +435,9 @@ class Archive:
                 else:
                     hex_digest_and_ec_id = digest_and_ec_id.hex()
                     yield f'file-hash *{hex_digest_and_ec_id} {paths}'
-            elif key.startswith(Archive.__FILE_METADATA_PREFIX):
+            elif key.startswith(Archive.__FILE_SIGNATURE_PREFIX):
                 from datetime import datetime, timezone
-                path = Path(*[part.decode() for part in key[len(Archive.__FILE_METADATA_PREFIX):].split(b'\0')])
+                path = Path(*[part.decode() for part in key[len(Archive.__FILE_SIGNATURE_PREFIX):].split(b'\0')])
                 [digest, mtime, ec_id] = msgpack.loads(value)
                 quoted_path = '/'.join((urllib.parse.quote_plus(part) for part in path.parts))
                 hex_digest = digest.hex()
@@ -393,13 +448,20 @@ class Archive:
                 yield f'OTHER {key} {value}'
 
     def _truncate(self):
+        self._write_config(Archive.__CONFIG_PENDING_ACTION, 'truncate')
         self._write_config(Archive.__CONFIG_HASH_ALGORITHM, None)
 
-        with self._file_hash_database.iterator() as it:
-            batch = self._file_hash_database.write_batch()
-            for key, _ in it:
-                batch.delete(key)
-            batch.write()
+        batch = self._file_signature_database.write_batch()
+        for key, _ in self._file_signature_database.iterator():
+            batch.delete(key)
+        batch.write()
+
+        batch = self._file_hash_database.write_batch()
+        for key, _ in self._file_hash_database.iterator():
+            batch.delete(key)
+        batch.write()
+
+        self._write_config(Archive.__CONFIG_PENDING_ACTION, None)
 
     def _write_config(self, entry: str, value: str | None) -> None:
         if value is None:
@@ -415,17 +477,39 @@ class Archive:
 
         return value
 
-    def _register_file(self, path, digest, mtime_ns: int, ec_id: int | None) -> None:
-        self._file_metadata_database.put(
+    def _register_file(self, path, signature: FileSignature) -> None:
+        self._file_signature_database.put(
             b'\0'.join((str(part).encode() for part in path.parts)),
-            msgpack.dumps([digest, mtime_ns, ec_id])
+            msgpack.dumps([signature.digest, signature.mtime_ns, signature.ec_id])
         )
 
+    def _deregister_file(self, path):
+        self._file_signature_database.delete(b'\0'.join((str(part).encode() for part in path.parts)))
+
+    def _lookup_file(self, path) -> FileSignature | None:
+        value = self._file_signature_database.get(b'\0'.join((str(part).encode() for part in path.parts)))
+
+        if value is None:
+            return None
+
+        return FileSignature(*msgpack.loads(value))
+
+    def _list_registered_files(self) -> Iterator[tuple[Path, FileSignature]]:
+        for key, value in self._file_signature_database.iterator():
+            path = Path(*[part.decode() for part in key.split(b'\0')])
+            signature = FileSignature(*msgpack.loads(value))
+            yield path, signature
+
     def _register_file_equivalents(self, digest: bytes, ec_id: int, paths: list[Path]) -> None:
-        data = [[str(part) for part in path.parts] for path in paths]
-        data.sort()
-        data = msgpack.dumps(data)
-        self._file_hash_database.put(digest + ec_id.to_bytes(length=4).lstrip(b'\0'), data)
+        key = digest + ec_id.to_bytes(length=4).lstrip(b'\0')
+
+        if not paths:
+            self._file_hash_database.delete(key)
+        else:
+            data = [[str(part) for part in path.parts] for path in paths]
+            data.sort()
+            data = msgpack.dumps(data)
+            self._file_hash_database.put(key, data)
 
     def _lookup_file_equivalents(self, digest: bytes) -> Iterable[tuple[int, list[Path]]]:
         ec_db: plyvel.DB = self._file_hash_database.prefixed_db(digest)

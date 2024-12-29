@@ -1,4 +1,5 @@
 import hashlib
+import os
 import re
 import tempfile
 import unittest
@@ -28,7 +29,7 @@ async def compute_xor(path: Path):
 
 
 class ArchiveTest(unittest.TestCase):
-    def test_rebuild_and_filter(self):
+    def test_common_lifecycle(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             archive_path = Path(tmpdir) / 'test_archive'
             archive_path.mkdir()
@@ -64,7 +65,39 @@ class ArchiveTest(unittest.TestCase):
                     archive.rebuild()
                     archive.rebuild()
                     self.assertEqual(
-                        _test_rebuild_and_filter_data,
+                        _test_common_lifecycle_0,
+                        set((re.sub('^(file-metadata .* mtime:)\\S*( .*)$', '\\1\\2', rec)
+                             for rec in archive.inspect()))
+                    )
+
+                with Archive(processor, str(archive_path)) as archive:
+                    archive.refresh()
+                    self.assertEqual(
+                        _test_common_lifecycle_0,
+                        set((re.sub('^(file-metadata .* mtime:)\\S*( .*)$', '\\1\\2', rec)
+                             for rec in archive.inspect()))
+                    )
+
+                    (archive_path / 'sample8' / 'sample10').unlink()
+                    archive.refresh()
+                    self.assertEqual(
+                        _test_common_lifecycle_1,
+                        set((re.sub('^(file-metadata .* mtime:)\\S*( .*)$', '\\1\\2', rec)
+                             for rec in archive.inspect()))
+                    )
+
+                    (archive_path / 'sample74' / 'sample10-another').unlink()
+                    archive.refresh()
+                    self.assertEqual(
+                        _test_common_lifecycle_2,
+                        set((re.sub('^(file-metadata .* mtime:)\\S*( .*)$', '\\1\\2', rec)
+                             for rec in archive.inspect()))
+                    )
+
+                    generate(archive_path / 'sample75', 'sample75')
+                    archive.refresh()
+                    self.assertEqual(
+                        _test_common_lifecycle_3,
                         set((re.sub('^(file-metadata .* mtime:)\\S*( .*)$', '\\1\\2', rec)
                              for rec in archive.inspect()))
                     )
@@ -73,8 +106,16 @@ class ArchiveTest(unittest.TestCase):
 
                 target.mkdir()
                 generate(target / 'sample-a', 'sample5')
-                generate(target / 'sample-b', 'sample72')
-                generate(target / 'retained', 'retained')
+                generate(target / 'sample-b', 'sample9')
+                generate(target / 'sample-c', 'sample72')
+                generate(target / 'sample-d', 'sample75')
+                generate(target / 'retained-a', 'retained')
+                generate(target / 'retained-b', 'sample10')
+
+                os.utime(target / 'sample-d', ns=(
+                    (archive_path / 'sample75').stat().st_atime_ns + 60000000000,
+                    (archive_path / 'sample75').stat().st_mtime_ns + 60000000000,
+                ))
 
                 class CollectingOutput(Output):
                     def __init__(self):
@@ -92,7 +133,10 @@ class ArchiveTest(unittest.TestCase):
                     diffptn.ignore(FileDifferenceKind.MTIME)
                     archive.find_duplicates(target, ignore=diffptn)
                     self.assertEqual(
-                        {(f'{target}/sample-a',), (f'{target}/sample-b',)},
+                        {(f'{target}/sample-a',),
+                         (f'{target}/sample-b',),
+                         (f'{target}/sample-c',),
+                         (f'{target}/sample-d',)},
                         set((tuple(r) for r in output.data))
                     )
 
@@ -102,15 +146,20 @@ class ArchiveTest(unittest.TestCase):
                     self.assertEqual(
                         {(f'{target}/sample-a',
                           '## identical file',
-                          '## ignored difference - atime',
-                          '## ignored difference - ctime',
                           '## ignored difference - mtime'),
                          (f'{target}/sample-b',
                           '## identical file',
-                          '## ignored difference - atime',
-                          '## ignored difference - ctime',
+                          '## ignored difference - mtime'),
+                         (f'{target}/sample-c',
+                          '## identical file',
+                          '## ignored difference - mtime'),
+                         (f'{target}/sample-d',
+                          '## identical file',
                           '## ignored difference - mtime')},
-                        set((tuple((re.sub('^(##[^:]*):.*', '\\1', p) for p in r)) for r in output.data))
+                        set((tuple(
+                            (re.sub('^(##[^:]*):.*', '\\1', p)
+                             for p in r if not re.match('^## ignored difference - [ac]time:', p)))
+                            for r in output.data))
                     )
 
                     output.data.clear()
@@ -125,15 +174,20 @@ class ArchiveTest(unittest.TestCase):
                     self.assertEqual(
                         {(f'# possible duplicate: {target}/sample-a',
                           '## file with identical content',
-                          '## difference - atime',
-                          '## difference - ctime',
                           '## difference - mtime'),
                          (f'# possible duplicate: {target}/sample-b',
                           '## file with identical content',
-                          '## difference - atime',
-                          '## difference - ctime',
+                          '## difference - mtime'),
+                         (f'# possible duplicate: {target}/sample-c',
+                          '## file with identical content',
+                          '## difference - mtime'),
+                         (f'# possible duplicate: {target}/sample-d',
+                          '## file with identical content',
                           '## difference - mtime')},
-                        set((tuple((re.sub('^(##[^:]*):.*', '\\1', p) for p in r)) for r in output.data)),
+                        set((tuple(
+                            (re.sub('^(##[^:]*):.*', '\\1', p)
+                             for p in r if not re.match('^## difference - [ac]time:', p)))
+                            for r in output.data)),
                     )
 
     def test_rebuild_with_collision(self):
@@ -161,7 +215,7 @@ class ArchiveTest(unittest.TestCase):
                     )
 
 
-_test_rebuild_and_filter_data = {
+_test_common_lifecycle_0 = {
     'config hash-algorithm sha256',
     'file-hash 012e06abd2e40aebd85e416c4c84d0409e131e7831b10fae1944972d01c03753 0 sample8/sample41',
     'file-hash 0576fefc966dc91b9860dc21a525cbbf4999330d3bd193973ca7e67624a4951b 0 sample8/sample38',
@@ -316,6 +370,30 @@ _test_rebuild_and_filter_data = {
     'file-metadata sample8/sample14 digest:ef99729801a2a675fba190fe8036f7fbac4ceed2e6d6f3880af370ef76b1610f mtime: ec_id:0',
     'file-metadata sample8/sample37 digest:77a38ff151a30571a4e7714cc769ab6f5f6625a8794ec4e1e964d8ba0db2b2a7 mtime: ec_id:0',
 }
+
+_test_common_lifecycle_1 = \
+    (_test_common_lifecycle_0 | {
+        'file-hash 3295e3883b6f050e81f0eb6e8adb918ffab48d462c607cc748e4e71378ee64e6 0 sample74/sample10-another',
+    }) - {
+        'file-hash 3295e3883b6f050e81f0eb6e8adb918ffab48d462c607cc748e4e71378ee64e6 0 sample74/sample10-another sample8/sample10',
+        'file-metadata sample8/sample10 digest:3295e3883b6f050e81f0eb6e8adb918ffab48d462c607cc748e4e71378ee64e6 mtime: ec_id:0',
+    }
+
+_test_common_lifecycle_2 = _test_common_lifecycle_0 - {
+    'file-metadata sample74/sample10-another digest:3295e3883b6f050e81f0eb6e8adb918ffab48d462c607cc748e4e71378ee64e6 mtime: ec_id:0',
+    'file-hash 3295e3883b6f050e81f0eb6e8adb918ffab48d462c607cc748e4e71378ee64e6 0 sample74/sample10-another sample8/sample10',
+    'file-metadata sample8/sample10 digest:3295e3883b6f050e81f0eb6e8adb918ffab48d462c607cc748e4e71378ee64e6 mtime: ec_id:0',
+}
+
+_test_common_lifecycle_3 = \
+    (_test_common_lifecycle_0 | {
+        'file-hash 8b1cebc0d516efab2efe357a3bb49fe2dc96a45263e20312b433fa0e11fb909d 0 sample75',
+        'file-metadata sample75 digest:8b1cebc0d516efab2efe357a3bb49fe2dc96a45263e20312b433fa0e11fb909d mtime: ec_id:0',
+    }) - {
+        'file-metadata sample74/sample10-another digest:3295e3883b6f050e81f0eb6e8adb918ffab48d462c607cc748e4e71378ee64e6 mtime: ec_id:0',
+        'file-metadata sample8/sample10 digest:3295e3883b6f050e81f0eb6e8adb918ffab48d462c607cc748e4e71378ee64e6 mtime: ec_id:0',
+        'file-hash 3295e3883b6f050e81f0eb6e8adb918ffab48d462c607cc748e4e71378ee64e6 0 sample74/sample10-another sample8/sample10',
+    }
 
 _test_rebuild_with_collision_data = {
     'config hash-algorithm xor',
