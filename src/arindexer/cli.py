@@ -11,8 +11,11 @@ def archive_indexer():
     parser.add_argument('--verbose', action='store_true')
     subparsers = parser.add_subparsers()
 
-    parser_find_duplicates = subparsers.add_parser('rebuild')
-    parser_find_duplicates.set_defaults(method=lambda a, _1, _2: a.rebuild())
+    parser_rebuild = subparsers.add_parser('rebuild')
+    parser_rebuild.set_defaults(method=lambda a, _1, _2: a.rebuild())
+
+    parser_refresh = subparsers.add_parser('refresh')
+    parser_refresh.set_defaults(method=lambda a, _1, _2: a.refresh())
 
     parser_find_duplicates = subparsers.add_parser('find-duplicates')
     parser_find_duplicates.add_argument('--ignore')
@@ -20,8 +23,8 @@ def archive_indexer():
     parser_find_duplicates.add_argument('file_or_directory', nargs='*')
     parser_find_duplicates.set_defaults(method=_find_duplicates)
 
-    parser_find_duplicates = subparsers.add_parser('inspect')
-    parser_find_duplicates.set_defaults(method=lambda a, _1, _2: a.inspect())
+    parser_inspect = subparsers.add_parser('inspect')
+    parser_inspect.set_defaults(method=_inspect)
 
     args = parser.parse_args()
 
@@ -62,6 +65,11 @@ def _find_duplicates(archive: Archive, output: StandardOutput, args):
             archive.find_duplicates(Path(file_or_directory), ignore=diffptn)
     finally:
         output.showing_possible_duplicates = saved_showing_possible_duplicates
+
+
+def _inspect(archive: Archive, output: StandardOutput, args):
+    for record in archive.inspect():
+        print(record)
 
 
 if __name__ == '__main__':
