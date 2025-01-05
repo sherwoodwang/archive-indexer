@@ -199,6 +199,10 @@ class StandardOutput(Output):
             print(part)
 
 
+class ArchiveIndexNotFound(FileNotFoundError):
+    pass
+
+
 class Archive:
     __CONFIG_PREFIX = b'c:'
     __FILE_HASH_PREFIX = b'h:'
@@ -207,7 +211,8 @@ class Archive:
     __CONFIG_HASH_ALGORITHM = 'hash-algorithm'
     __CONFIG_PENDING_ACTION = 'truncating'
 
-    def __init__(self, processor: Processor, path: str, output: Output | None = None):
+    def __init__(self, processor: Processor, path: str | os.PathLike, create: bool = False,
+                 output: Output | None = None):
         archive_path = Path(path)
 
         if output is None:
@@ -220,7 +225,15 @@ class Archive:
             raise NotADirectoryError(f"Archive {archive_path} is not a directory")
 
         index_path = archive_path / '.aridx'
-        index_path.mkdir(exist_ok=True)
+
+        if create:
+            index_path.mkdir(exist_ok=True)
+
+        if not index_path.exists():
+            raise ArchiveIndexNotFound(f"The index for archive {archive_path} has not been created")
+
+        if not index_path.is_dir():
+            raise NotADirectoryError(f"The index for archive {archive_path} is not a directory")
 
         database_path = index_path / 'database'
 
@@ -262,7 +275,7 @@ class Archive:
         self.close()
 
     def close(self):
-        if not self._alive:
+        if not getattr(self, '_alive', False):
             return
 
         self._alive = False

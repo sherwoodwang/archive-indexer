@@ -61,7 +61,7 @@ class ArchiveTest(unittest.TestCase):
                 generate(archive_path / 'sample74' / f'sample{i}-another', f'sample{i}')
 
             with Processor() as processor:
-                with Archive(processor, str(archive_path)) as archive:
+                with Archive(processor, str(archive_path), create=True) as archive:
                     archive.rebuild()
                     archive.rebuild()
                     self.assertEqual(
@@ -202,7 +202,7 @@ class ArchiveTest(unittest.TestCase):
                     (i * 2).to_bytes(length=2) * 2 + (i * 2 + 1).to_bytes(length=2) * 2)
 
             with Processor() as processor:
-                with Archive(processor, str(archive_path)) as archive:
+                with Archive(processor, str(archive_path), create=True) as archive:
                     archive._hash_algorithms['xor'] = (4, compute_xor)
                     archive._default_hash_algorithm = 'xor'
 

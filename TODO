@@ -1,2 +1,6 @@
 handle missing files in the archive
 add logs to track progress
+recover atime if necessary
+add forced refresh, ignoring mtime
+graceful interrupting
+use 0 as separators
