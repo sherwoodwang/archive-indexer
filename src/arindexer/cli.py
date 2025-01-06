@@ -2,7 +2,7 @@ import argparse
 import os
 from pathlib import Path
 
-from . import Archive, Processor, FileMetadataDifferencePattern, FileDifferenceKind, StandardOutput, \
+from . import Archive, Processor, FileMetadataDifferencePattern, FileMetadataDifferenceType, StandardOutput, \
     ArchiveIndexNotFound
 
 
@@ -74,7 +74,7 @@ def _find_duplicates(archive: Archive, output: StandardOutput, args):
             if not kind:
                 continue
 
-            diffptn.ignore(FileDifferenceKind(kind))
+            diffptn.ignore(FileMetadataDifferenceType(kind))
     else:
         diffptn.ignore_trivial_attributes()
 

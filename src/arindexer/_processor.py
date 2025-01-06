@@ -1,9 +1,11 @@
 import asyncio
+import datetime
 import filecmp
 import hashlib
 import multiprocessing
 import pathlib
 import stat
+from enum import StrEnum
 from typing import Awaitable
 
 
@@ -45,6 +47,34 @@ def compare_file_metadata(a: pathlib.Path, b: pathlib.Path):
     return diffs
 
 
+class FileMetadataDifferenceType(StrEnum):
+    ATIME = 'atime'
+    CTIME = 'ctime'
+    MTIME = 'mtime'
+    BIRTHTIME = 'birthtime'
+
+
+class FileMetadataDifference:
+    def __init__(self, type: str, a, b):
+        self.type = FileMetadataDifferenceType(type)
+        self.a = a
+        self.b = b
+
+    def description(self, tag_a: str | None = None, tag_b: str | None = None, *, tz=None):
+        label_a = "" if tag_a is None else f" ({tag_a})"
+        label_b = "" if tag_a is None else f" ({tag_b})"
+        if self.type in ["atime", "ctime", "mtime", "birthtime"]:
+            if tz is None:
+                tz = datetime.UTC
+            ts_a = datetime.datetime.fromtimestamp(self.a // 1000000000, tz=tz)\
+                .strftime("%Y-%m-%dT%H:%M:%S.{:09}Z").format(self.a % 1000000000)
+            ts_b = datetime.datetime.fromtimestamp(self.b // 1000000000, tz=tz)\
+                .strftime("%Y-%m-%dT%H:%M:%S.{:09}Z").format(self.b % 1000000000)
+            return f"{self.type}: {ts_a}{label_a} != {ts_b}{label_b}"
+        else:
+            return f"{self.type}: {self.a}{label_a} != {self.b}{label_b}"
+
+
 class Processor:
     def __init__(self, concurrency: int | None = None):
         if concurrency is None:
@@ -75,8 +105,11 @@ class Processor:
         :return: True if two files are equal, False otherwise."""
         return self._evaluate(compare_file_content, a, b)
 
-    def compare_metadata(self, a: pathlib.Path, b: pathlib.Path) -> Awaitable[list[tuple[str, any, any]]]:
-        return self._evaluate(compare_file_metadata, a, b)
+    def compare_metadata(self, a: pathlib.Path, b: pathlib.Path) -> Awaitable[list[FileMetadataDifference]]:
+        async def evaluate_and_convert():
+            return [FileMetadataDifference(*t) for t in await self._evaluate(compare_file_metadata, a, b)]
+
+        return evaluate_and_convert()
 
     def _evaluate(self, func, *args):
         loop = asyncio.get_running_loop()

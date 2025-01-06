@@ -5,14 +5,13 @@ import stat
 import urllib.parse
 from asyncio import TaskGroup, Semaphore, Lock, Condition
 from dataclasses import dataclass
-from enum import StrEnum
 from pathlib import Path
 from typing import Iterator, Iterable
 
 import msgpack
 import plyvel
 
-from ._processor import Processor
+from ._processor import Processor, FileMetadataDifference, FileMetadataDifferenceType
 
 
 class Throttler:
@@ -70,33 +69,26 @@ class LockTable:
         return LockTable._Lock(self, entry)
 
 
-class FileDifferenceKind(StrEnum):
-    ATIME = 'atime'
-    CTIME = 'ctime'
-    MTIME = 'mtime'
-    BIRTHTIME = 'birthtime'
-
-
 class FileMetadataDifferencePattern:
     def __init__(self):
-        self._ignored_patterns: set[FileDifferenceKind] = set()
+        self._ignored_patterns: set[FileMetadataDifferenceType] = set()
 
     def ignore_trivial_attributes(self):
-        self.ignore(FileDifferenceKind.ATIME)
-        self.ignore(FileDifferenceKind.CTIME)
+        self.ignore(FileMetadataDifferenceType.ATIME)
+        self.ignore(FileMetadataDifferenceType.CTIME)
 
     def ignore_all(self):
-        for kind in FileDifferenceKind:
-            kind: FileDifferenceKind
+        for kind in FileMetadataDifferenceType:
+            kind: FileMetadataDifferenceType
             self.ignore(kind)
 
-    def ignore(self, kind: FileDifferenceKind):
+    def ignore(self, kind: FileMetadataDifferenceType):
         self._ignored_patterns.add(kind)
 
-    def is_ignored(self, diff_desc: tuple[str, any, any]) -> bool:
-        return FileDifferenceKind(diff_desc[0]) in self._ignored_patterns
+    def is_ignored(self, diff_desc: FileMetadataDifference) -> bool:
+        return diff_desc.type in self._ignored_patterns
 
-    def filter(self, diffs: Iterable[tuple[str, any, any]]) -> list[tuple[str, any, any]]:
+    def filter(self, diffs: Iterable[FileMetadataDifference]) -> list[FileMetadataDifference]:
         return [diff for diff in diffs if not self.is_ignored(diff)]
 
 
@@ -167,7 +159,7 @@ class Output(metaclass=abc.ABCMeta):
         if self.verbosity >= 1:
             record.append(f"## identical file: {equivalent}")
             for diff in diffs:
-                record.append(f"## ignored difference - {diff[0]}: {diff[1]} != {diff[2]}")
+                record.append(f"## ignored difference - {diff.description('indexed', 'target')}")
 
         self._produce(record)
 
@@ -179,13 +171,13 @@ class Output(metaclass=abc.ABCMeta):
                 record.append(f"## file with identical content: {candidate}")
 
                 for diff in major_diffs:
-                    record.append(f"## difference - {diff[0]}: {diff[1]} != {diff[2]}")
+                    record.append(f"## difference - {diff.description('indexed', 'target')}")
 
                 for diff in diffs:
                     if diff in major_diffs:
                         continue
 
-                    record.append(f"## ignored difference - {diff[0]}: {diff[1]} != {diff[2]}")
+                    record.append(f"## ignored difference - {diff.description('indexed', 'target')}")
 
             self._produce(record)
 
@@ -368,9 +360,6 @@ class Archive:
             for path, handle in self._walk_archive():
                 if handle.is_file():
                     await throttler.schedule(handle_file(path, handle))
-                else:
-                    # TODO
-                    pass
 
     def find_duplicates(self, input: Path, ignore: FileMetadataDifferencePattern | None = None):
         asyncio.run(self._do_find_duplicates(input, ignore=ignore))
@@ -413,15 +402,11 @@ class Archive:
                 self._output.produce_duplicate(path, equivalent, diffs)
 
             for path, handle in self._walk(input):
-                if path.is_dir():
-                    # TODO
-                    #  1. avoid creating archived directories
-                    #  2. change mode after all files are linked
+                if path.is_symlink():
                     pass
                 elif path.is_file():
                     await throttler.schedule(handle_file(path, handle))
                 else:
-                    # TODO
                     pass
 
     def inspect(self) -> Iterator[str]:

@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from arindexer import Archive, FileMetadataDifferencePattern, FileDifferenceKind, Output
+from arindexer import Archive, FileMetadataDifferencePattern, FileMetadataDifferenceType, Output
 # noinspection PyProtectedMember
 from arindexer._processor import Processor
 
@@ -128,9 +128,9 @@ class ArchiveTest(unittest.TestCase):
                 output = CollectingOutput()
                 with Archive(processor, str(archive_path), output=output) as archive:
                     diffptn = FileMetadataDifferencePattern()
-                    diffptn.ignore(FileDifferenceKind.ATIME)
-                    diffptn.ignore(FileDifferenceKind.CTIME)
-                    diffptn.ignore(FileDifferenceKind.MTIME)
+                    diffptn.ignore(FileMetadataDifferenceType.ATIME)
+                    diffptn.ignore(FileMetadataDifferenceType.CTIME)
+                    diffptn.ignore(FileMetadataDifferenceType.MTIME)
                     archive.find_duplicates(target, ignore=diffptn)
                     self.assertEqual(
                         {(f'{target}/sample-a',),
