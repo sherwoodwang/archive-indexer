@@ -117,20 +117,12 @@ class ArchiveTest(unittest.TestCase):
                     (archive_path / 'sample75').stat().st_mtime_ns + 60000000000,
                 ))
 
-                class CollectingOutput(Output):
-                    def __init__(self):
-                        super().__init__()
-                        self.data: list[list[str]] = []
-
-                    def _produce(self, record):
-                        self.data.append(record)
-
-                output = CollectingOutput()
+                output = ArchiveTest.CollectingOutput()
                 with Archive(processor, str(archive_path), output=output) as archive:
                     diffptn = FileMetadataDifferencePattern()
-                    diffptn.ignore(FileMetadataDifferenceType.ATIME)
-                    diffptn.ignore(FileMetadataDifferenceType.CTIME)
-                    diffptn.ignore(FileMetadataDifferenceType.MTIME)
+                    diffptn.add(FileMetadataDifferenceType.ATIME)
+                    diffptn.add(FileMetadataDifferenceType.CTIME)
+                    diffptn.add(FileMetadataDifferenceType.MTIME)
                     archive.find_duplicates(target, ignore=diffptn)
                     self.assertEqual(
                         {(f'{target}/sample-a',),
@@ -145,19 +137,21 @@ class ArchiveTest(unittest.TestCase):
                     archive.find_duplicates(target, ignore=diffptn)
                     self.assertEqual(
                         {(f'{target}/sample-a',
-                          '## identical file',
+                          '## identical file: sample1/sample4/sample5',
                           '## ignored difference - mtime'),
                          (f'{target}/sample-b',
-                          '## identical file',
+                          '## identical file: sample74/sample9-another',
+                          '## ignored difference - mtime',
+                          '## identical file: sample8/sample9',
                           '## ignored difference - mtime'),
                          (f'{target}/sample-c',
-                          '## identical file',
+                          '## identical file: sample8/sample72',
                           '## ignored difference - mtime'),
                          (f'{target}/sample-d',
-                          '## identical file',
+                          '## identical file: sample75',
                           '## ignored difference - mtime')},
                         set((tuple(
-                            (re.sub('^(##[^:]*):.*', '\\1', p)
+                            (re.sub('^(##[^:]* difference[^:]*):.*', '\\1', p)
                              for p in r if not re.match('^## ignored difference - [ac]time:', p)))
                             for r in output.data))
                     )
@@ -169,23 +163,25 @@ class ArchiveTest(unittest.TestCase):
 
                     output.data.clear()
                     output.verbosity = 1
-                    output.showing_possible_duplicates = True
+                    output.showing_content_wise_duplicates = True
                     archive.find_duplicates(target)
                     self.assertEqual(
-                        {(f'# possible duplicate: {target}/sample-a',
-                          '## file with identical content',
+                        {(f'# content-wise duplicate: {target}/sample-a',
+                          '## file with identical content: sample1/sample4/sample5',
                           '## difference - mtime'),
-                         (f'# possible duplicate: {target}/sample-b',
-                          '## file with identical content',
+                         (f'# content-wise duplicate: {target}/sample-b',
+                          '## file with identical content: sample74/sample9-another',
+                          '## difference - mtime',
+                          '## file with identical content: sample8/sample9',
                           '## difference - mtime'),
-                         (f'# possible duplicate: {target}/sample-c',
-                          '## file with identical content',
+                         (f'# content-wise duplicate: {target}/sample-c',
+                          '## file with identical content: sample8/sample72',
                           '## difference - mtime'),
-                         (f'# possible duplicate: {target}/sample-d',
-                          '## file with identical content',
+                         (f'# content-wise duplicate: {target}/sample-d',
+                          '## file with identical content: sample75',
                           '## difference - mtime')},
                         set((tuple(
-                            (re.sub('^(##[^:]*):.*', '\\1', p)
+                            (re.sub('^(##[^:]* difference[^:]*):.*', '\\1', p)
                              for p in r if not re.match('^## difference - [ac]time:', p)))
                             for r in output.data)),
                     )
@@ -213,6 +209,91 @@ class ArchiveTest(unittest.TestCase):
                         set((re.sub('^(file-metadata .* mtime:)\\S*( .*)$', '\\1\\2', rec)
                              for rec in archive.inspect()))
                     )
+
+    def test_directory_duplicates(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            archive_path = Path(tmpdir) / 'test_archive'
+            archive_path.mkdir()
+
+            (archive_path / 'dir0').mkdir()
+            (archive_path / 'dir0' / 'sample0').write_bytes(b'sample0')
+            (archive_path / 'dir0' / 'dir1').mkdir()
+            (archive_path / 'dir0' / 'dir1' / 'sample0').write_bytes(b'sample0')
+            (archive_path / 'dir0' / 'dir1' / 'sample1').write_bytes(b'sample1')
+
+            target = Path(tmpdir) / 'target'
+            target.mkdir()
+
+            (target / 'dir-dup').mkdir()
+            (target / 'dir-dup' / 'sample0').write_bytes(b'sample0')
+            self._copy_times((archive_path / 'dir0' / 'dir1' / 'sample0'), (target / 'dir-dup' / 'sample0'))
+            (target / 'dir-dup' / 'sample1').write_bytes(b'sample1')
+            self._copy_times((archive_path / 'dir0' / 'dir1' / 'sample1'), (target / 'dir-dup' / 'sample1'))
+
+            with Processor() as processor:
+                output = ArchiveTest.CollectingOutput()
+                with Archive(processor, str(archive_path), create=True, output=output) as archive:
+                    archive.rebuild()
+                    output.verbosity = 1
+                    archive.find_duplicates(target, ignore=FileMetadataDifferencePattern.TRIVIAL)
+                    self.assertEqual(
+                        {(f'{target}/dir-dup{os.sep}',
+                          f'## identical directory: dir0/dir1{os.sep}',)},
+                        set((tuple(
+                            (re.sub('^(##[^:]* difference[^:]*):.*', '\\1', p)
+                             for p in r if not re.match('^## ignored difference - [ac]time:', p)))
+                            for r in output.data))
+                    )
+
+    def test_directory_duplicates_with_symbolic_links(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            archive_path = Path(tmpdir) / 'test_archive'
+            archive_path.mkdir()
+
+            (archive_path / 'dir0').mkdir()
+            (archive_path / 'dir0' / 'sample0').write_bytes(b'sample0')
+            (archive_path / 'dir0' / 'dir1').mkdir()
+            (archive_path / 'dir0' / 'dir1' / 'sample0').write_bytes(b'sample0')
+            (archive_path / 'dir0' / 'dir1' / 'sample1').write_bytes(b'sample1')
+            (archive_path / 'dir0' / 'dir1' / 'sample-link0').symlink_to('sample-link0')
+
+            target = Path(tmpdir) / 'target'
+            target.mkdir()
+
+            (target / 'dir-dup').mkdir()
+            (target / 'dir-dup' / 'sample0').write_bytes(b'sample0')
+            self._copy_times((archive_path / 'dir0' / 'dir1' / 'sample0'), (target / 'dir-dup' / 'sample0'))
+            (target / 'dir-dup' / 'sample1').write_bytes(b'sample1')
+            self._copy_times((archive_path / 'dir0' / 'dir1' / 'sample1'), (target / 'dir-dup' / 'sample1'))
+            (target / 'dir-dup' / 'sample-link0').symlink_to('sample-link0')
+
+            with Processor() as processor:
+                output = ArchiveTest.CollectingOutput()
+                with Archive(processor, str(archive_path), create=True, output=output) as archive:
+                    archive.rebuild()
+                    output.verbosity = 1
+                    archive.find_duplicates(target, ignore=FileMetadataDifferencePattern.TRIVIAL)
+                    self.assertEqual(
+                        {(f'{target}/dir-dup{os.sep}',
+                          f'## identical directory: dir0/dir1{os.sep}',)},
+                        set((tuple(
+                            (re.sub('^(##[^:]* difference[^:]*):.*', '\\1', p)
+                             for p in r if not re.match('^## ignored difference - [ac]time:', p)))
+                            for r in output.data))
+                    )
+
+    @staticmethod
+    def _copy_times(src: Path, dest: Path):
+        st = src.lstat()
+        os.utime(dest, ns=(st.st_atime_ns, st.st_mtime_ns), follow_symlinks=False)
+
+    class CollectingOutput(Output):
+        def __init__(self):
+            super().__init__()
+            self.data: list[list[str]] = []
+
+        def _offer(self, record):
+            self.data.append(record)
 
 
 _test_common_lifecycle_0 = {

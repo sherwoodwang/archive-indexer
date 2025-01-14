@@ -74,19 +74,19 @@ def _find_duplicates(archive: Archive, output: StandardOutput, args):
             if not kind:
                 continue
 
-            diffptn.ignore(FileMetadataDifferenceType(kind))
+            diffptn.add(FileMetadataDifferenceType(kind))
     else:
-        diffptn.ignore_trivial_attributes()
+        diffptn.add_trivial_attributes()
 
-    saved_showing_possible_duplicates = output.showing_possible_duplicates
+    saved_showing_content_wise_duplicates = output.showing_content_wise_duplicates
     try:
         if args.show_possible_duplicates:
-            output.showing_possible_duplicates = True
+            output.showing_content_wise_duplicates = True
 
         for file_or_directory in args.file_or_directory:
             archive.find_duplicates(Path(file_or_directory), ignore=diffptn)
     finally:
-        output.showing_possible_duplicates = saved_showing_possible_duplicates
+        output.showing_content_wise_duplicates = saved_showing_content_wise_duplicates
 
 
 def _inspect(archive: Archive, output: StandardOutput, args):

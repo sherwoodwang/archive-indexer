@@ -1,12 +1,15 @@
 import abc
 import asyncio
+import contextvars
 import os
 import stat
+import threading
 import urllib.parse
-from asyncio import TaskGroup, Semaphore, Lock, Condition
+from asyncio import TaskGroup, Semaphore, Lock, Condition, Future
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import Iterator, Iterable
+from typing import Any, Iterator, Iterable, Callable, Awaitable, TypeAlias, final
 
 import msgpack
 import plyvel
@@ -19,20 +22,41 @@ class Throttler:
         self._task_group = task_group
         self._semaphore = Semaphore(concurrency)
 
-    async def schedule(self, coro, name=None, context=None):
+    async def schedule(self, coro, name=None, context=None) -> asyncio.Task:
         await self._semaphore.acquire()
 
         async def wrapper():
+            tenure = Throttler.__Tenure(lambda: self._semaphore.release())
+            token = Throttler.__tenure.set(tenure)
             try:
                 return await coro
             finally:
-                self._semaphore.release()
+                Throttler.__tenure.reset(token)
+                tenure.release()
 
         try:
-            self._task_group.create_task(wrapper(), name=name, context=context)
+            return self._task_group.create_task(wrapper(), name=name, context=context)
         except:
             self._semaphore.release()
             raise
+
+    @staticmethod
+    def terminate_current_tenure():
+        Throttler.__tenure.get().terminate()
+
+    __tenure = contextvars.ContextVar('Throttler.__tenure')
+
+    class __Tenure:
+        def __init__(self, release):
+            self.lock = threading.Lock()
+            self.released = False
+            self.release = lambda: release()
+
+        def terminate(self):
+            with self.lock:
+                self.release()
+                self.release = lambda: None
+                self.released = True
 
 
 class LockTable:
@@ -70,41 +94,158 @@ class LockTable:
 
 
 class FileMetadataDifferencePattern:
+    ALL: 'FileMetadataDifferencePattern'
+    TRIVIAL: 'FileMetadataDifferencePattern'
+
     def __init__(self):
-        self._ignored_patterns: set[FileMetadataDifferenceType] = set()
+        self._value: set[FileMetadataDifferenceType] = set()
 
-    def ignore_trivial_attributes(self):
-        self.ignore(FileMetadataDifferenceType.ATIME)
-        self.ignore(FileMetadataDifferenceType.CTIME)
+    def add_trivial_attributes(self):
+        self.add(FileMetadataDifferenceType.ATIME)
+        self.add(FileMetadataDifferenceType.CTIME)
 
-    def ignore_all(self):
+    def add_all(self):
         for kind in FileMetadataDifferenceType:
             kind: FileMetadataDifferenceType
-            self.ignore(kind)
+            self.add(kind)
 
-    def ignore(self, kind: FileMetadataDifferenceType):
-        self._ignored_patterns.add(kind)
+    def add(self, kind: FileMetadataDifferenceType):
+        self._value.add(kind)
 
-    def is_ignored(self, diff_desc: FileMetadataDifference) -> bool:
-        return diff_desc.type in self._ignored_patterns
-
-    def filter(self, diffs: Iterable[FileMetadataDifference]) -> list[FileMetadataDifference]:
-        return [diff for diff in diffs if not self.is_ignored(diff)]
+    def match(self, diff_desc: FileMetadataDifference) -> bool:
+        return diff_desc.type in self._value
 
 
 FileMetadataDifferencePattern.ALL = FileMetadataDifferencePattern()
-FileMetadataDifferencePattern.ALL.ignore_all()
+FileMetadataDifferencePattern.ALL.add_all()
+
+FileMetadataDifferencePattern.TRIVIAL = FileMetadataDifferencePattern()
+FileMetadataDifferencePattern.TRIVIAL.add_trivial_attributes()
 
 
-class FileHandle:
+class Message(metaclass=abc.ABCMeta):
+    @abc.abstractmethod
+    def deliver(self, value) -> Future[Any]:
+        raise NotImplementedError()
+
+    @abc.abstractmethod
+    def deliver_nowait(self, value) -> None:
+        raise NotImplementedError()
+
+
+class ConcreteMessage(Message):
+    def __init__(self, notify_delivery: Callable[[], None]):
+        self._notify_delivery = notify_delivery
+        self._delivered = False
+        self.value = None
+        self._reply = None
+
+    def deliver(self, value) -> Future[Any]:
+        if self._delivered:
+            raise RuntimeError("already delivered")
+
+        loop = asyncio.get_running_loop()
+        future_reply = loop.create_future()
+        self._reply = lambda r: loop.call_soon_threadsafe(future_reply.set_result, r)
+
+        self.value = value
+
+        self._notify_delivery()
+        self._delivered = True
+
+        return future_reply
+
+    def deliver_nowait(self, value) -> None:
+        self._reply = lambda r: None
+        self.value = value
+        self._notify_delivery()
+        self._delivered = True
+
+    def reply(self, reply):
+        self._reply(reply)
+
+
+class DiscardedMessage(Message):
+    def __init__(self, reply: Any):
+        self._reply = reply
+
+    def deliver(self, value) -> Future[Any]:
+        future = asyncio.get_event_loop().create_future()
+        future.set_result(self._reply)
+        return future
+
+    def deliver_nowait(self, value) -> None:
+        pass
+
+
+TaskGroupLike: TypeAlias = TaskGroup | asyncio.AbstractEventLoop
+MessageProcessor: TypeAlias = Callable[[Callable[[Any], None], list[Any]], Awaitable[None]]
+
+
+class MessageGatherer:
+    def __init__(self, task_group: TaskGroupLike, processor: MessageProcessor):
+        self._task_group = task_group
+        self._processor = processor
+        self._messages: list[ConcreteMessage] = []
+        self._delivered = 0
+        self._completed = False
+
+    def send(self) -> Message:
+        message = ConcreteMessage(self._notify_delivery)
+        self._messages.append(message)
+        return message
+
+    def _notify_delivery(self):
+        self._delivered += 1
+        self._trigger_if_possible()
+
+    def complete(self):
+        self._completed = True
+        self._trigger_if_possible()
+
+    def _trigger_if_possible(self):
+        if not (self._completed and self._delivered == len(self._messages)):
+            return
+
+        replied = False
+        lock = threading.Lock()
+
+        def reply(value):
+            nonlocal replied
+
+            with lock:
+                if replied:
+                    raise RuntimeError("already replied")
+                replied = True
+
+            for message in self._messages:
+                message.reply(value)
+
+        async def trigger():
+            await self._processor(reply, [msg.value for msg in self._messages])
+
+            if not replied:
+                reply(None)
+
+        self._task_group.create_task(trigger())
+
+
+class FileContext:
     def __init__(self, parent, name: str | None, st: os.stat_result):
-        self.parent: FileHandle = parent
+        self._parent: FileContext | None = parent
         self.name: str = name
         self.stat: os.stat_result = st
         self.exclusion: set[str] = set()
 
-        self._scanned = False
-        self._child_count: int = 0
+        self._completed = False
+        self._message_gatherer: dict[any, MessageGatherer] = {}
+
+    @property
+    def parent(self) -> 'FileContext':
+        if self._parent is None:
+            raise LookupError("no parent")
+
+        return self._parent
 
     def exclude(self, filename):
         self.exclusion.add(filename)
@@ -114,27 +255,60 @@ class FileHandle:
 
     def relative_path(self) -> Path:
         path = None
-        handle = self
-        while handle:
-            if handle.name is not None:
+
+        context = self
+        while context is not None:
+            if context.name is not None:
                 if path is None:
-                    path = Path(handle.name)
+                    path = Path(context.name)
                 else:
-                    path = Path(handle.name) / path
-            handle = handle.parent
+                    path = Path(context.name) / path
+
+            context = context._parent
+
         return path
 
-    def register_child(self):
-        if self._scanned:
-            raise ValueError("cannot register a new child after scanning is done")
+    def complete(self):
+        for message_gatherer in self._message_gatherer.values():
+            message_gatherer.complete()
 
-        self._child_count += 1
-
-    def set_scanned(self):
-        self._scanned = True
+        self._completed = True
 
     def is_file(self):
         return stat.S_ISREG(self.stat.st_mode)
+
+    def send_message(self, key: Any, fallback: Callable[[], Message] | None = None) -> Message:
+        """
+        Send a message to the parent file context.
+
+        This method only creates a stub at the parent file context. The actual content is delivered later with
+        Message.deliver().
+
+        :param key: the key of the message processor.
+        :param fallback: the function to be called when the message processor hasn't been registered; None produces
+        KeyError in that case.
+        :return: the message object.
+        """
+
+        try:
+            message_gatherer = self._message_gatherer[key]
+        except KeyError:
+            if fallback is None:
+                raise
+            else:
+                return fallback()
+
+        return message_gatherer.send()
+
+    def register_message_processor(
+            self, task_group: TaskGroupLike, key: Any, processor: MessageProcessor):
+        if self._completed:
+            raise RuntimeError("the file context has already completed")
+
+        if key in self._message_gatherer:
+            raise RuntimeError('the message processor has already been initialized')
+
+        self._message_gatherer[key] = MessageGatherer(task_group, processor)
 
 
 @dataclass
@@ -147,46 +321,50 @@ class FileSignature:
 class Output(metaclass=abc.ABCMeta):
     def __init__(self):
         self.verbosity = 0
-        self.showing_possible_duplicates = False
+        self.showing_content_wise_duplicates = False
 
     @abc.abstractmethod
-    def _produce(self, record: list[str]):
+    def _offer(self, record: list[str]):
         raise NotImplementedError()
 
-    def produce_duplicate(self, path, equivalent, diffs):
-        record = [str(path)]
+    def describe_duplicate(
+            self, path: Path, is_directory: bool, duplicates: list[tuple[Path, list[FileMetadataDifference]]]):
+        suffix = os.sep if is_directory else ''
+        record = [str(path) + suffix]
 
         if self.verbosity >= 1:
-            record.append(f"## identical file: {equivalent}")
-            for diff in diffs:
-                record.append(f"## ignored difference - {diff.description('indexed', 'target')}")
-
-        self._produce(record)
-
-    def produce_possible_duplicate(self, path, candidate, major_diffs, diffs):
-        if self.showing_possible_duplicates:
-            record = [f'# possible duplicate: {str(path)}']
-
-            if self.verbosity >= 1:
-                record.append(f"## file with identical content: {candidate}")
-
-                for diff in major_diffs:
-                    record.append(f"## difference - {diff.description('indexed', 'target')}")
-
+            for duplicate, diffs in duplicates:
+                record.append(f"## identical {'directory' if is_directory else 'file'}: {duplicate}{suffix}")
                 for diff in diffs:
-                    if diff in major_diffs:
-                        continue
-
                     record.append(f"## ignored difference - {diff.description('indexed', 'target')}")
 
-            self._produce(record)
+        self._offer(record)
+
+    def describe_content_wise_duplicate(self, path, duplicates):
+        if self.showing_content_wise_duplicates:
+            record = [f'# content-wise duplicate: {str(path)}']
+
+            if self.verbosity >= 1:
+                for candidate, major_diffs, diffs in duplicates:
+                    record.append(f"## file with identical content: {candidate}")
+
+                    for diff in major_diffs:
+                        record.append(f"## difference - {diff.description('indexed', 'target')}")
+
+                    for diff in diffs:
+                        if diff in major_diffs:
+                            continue
+
+                        record.append(f"## ignored difference - {diff.description('indexed', 'target')}")
+
+            self._offer(record)
 
 
 class StandardOutput(Output):
     def __init__(self):
         super().__init__()
 
-    def _produce(self, record):
+    def _offer(self, record):
         for part in record:
             print(part)
 
@@ -302,9 +480,9 @@ class Archive:
 
             _, calculate_digest = self._hash_algorithms[hash_algorithm]
 
-            async def handle_file(path: Path, handle: FileHandle):
-                if self._lookup_file(handle.relative_path()) is None:
-                    return await generate_signature(path, handle.relative_path(), handle.stat.st_mtime_ns)
+            async def handle_file(path: Path, context: FileContext):
+                if self._lookup_file(context.relative_path()) is None:
+                    return await generate_signature(path, context.relative_path(), context.stat.st_mtime_ns)
 
             async def refresh_entry(relative_path: Path, signature: FileSignature):
                 path = (self._archive_path / relative_path)
@@ -313,7 +491,7 @@ class Archive:
                     self._register_file(relative_path, FileSignature(signature.digest, signature.mtime_ns, None))
 
                     async with lock_table.lock(signature.digest):
-                        for ec_id, paths in self._lookup_file_equivalents(signature.digest):
+                        for ec_id, paths in self._list_content_equivalent_classes(signature.digest):
                             if relative_path in paths:
                                 paths.remove(relative_path)
                                 break
@@ -321,7 +499,7 @@ class Archive:
                             ec_id = None
 
                         if ec_id is not None:
-                            self._register_file_equivalents(signature.digest, ec_id, paths)
+                            self._store_content_equivalent_class(signature.digest, ec_id, paths)
 
                     self._deregister_file(relative_path)
 
@@ -339,7 +517,7 @@ class Archive:
 
                 async with lock_table.lock(digest):
                     next_ec_id = 0
-                    for ec_id, paths in self._lookup_file_equivalents(digest):
+                    for ec_id, paths in self._list_content_equivalent_classes(digest):
                         if next_ec_id <= ec_id:
                             next_ec_id = ec_id + 1
 
@@ -351,15 +529,15 @@ class Archive:
                         paths = [relative_path]
 
                     self._register_file(relative_path, FileSignature(digest, mtime, None))
-                    self._register_file_equivalents(digest, ec_id, paths)
+                    self._store_content_equivalent_class(digest, ec_id, paths)
                     self._register_file(relative_path, FileSignature(digest, mtime, ec_id))
 
             for path, signature in self._list_registered_files():
                 await throttler.schedule(refresh_entry(path, signature))
 
-            for path, handle in self._walk_archive():
-                if handle.is_file():
-                    await throttler.schedule(handle_file(path, handle))
+            for path, context in self._walk_archive():
+                if context.is_file():
+                    await throttler.schedule(handle_file(path, context))
 
     def find_duplicates(self, input: Path, ignore: FileMetadataDifferencePattern | None = None):
         asyncio.run(self._do_find_duplicates(input, ignore=ignore))
@@ -376,38 +554,241 @@ class Archive:
         if hash_algorithm not in self._hash_algorithms:
             raise RuntimeError(f"Unknown hash algorithm: {hash_algorithm}")
 
-        async with TaskGroup() as tg:
+        async with (TaskGroup() as tg):
             throttler = Throttler(tg, self._processor.concurrency * 2)
             _, calculate_digest = self._hash_algorithms[self._default_hash_algorithm]
 
-            async def handle_file(path: Path, handle: FileHandle):
+            @dataclass
+            class DiscoveredDuplicate:
+                path_in_archive: Path
+                major_diffs: list[FileMetadataDifference]
+                minor_diffs: list[FileMetadataDifference]
+
+            @dataclass
+            class DirectoryEntryResult:
+                name: str
+                file_size: int
+                deferred_comparison: bool
+                extensions: list[DiscoveredDuplicate]
+                duplicates: list[DiscoveredDuplicate]
+                content_wise_duplicates: list[DiscoveredDuplicate]
+
+            @dataclass
+            class DirectoryResult:
+                inhibit_file_report: bool
+
+            async def handle_file(path: Path, context: FileContext, message_to_parent: Message):
                 digest = await calculate_digest(path)
 
-                for ec_id, paths in self._lookup_file_equivalents(digest):
+                # Find an equivalent class where the contents of files match the file at 'path'.
+                for ec_id, paths in self._list_content_equivalent_classes(digest):
                     if await self._processor.compare_content(self._archive_path / paths[0], path):
-                        for candidate in paths:
-                            diffs = await self._processor.compare_metadata(self._archive_path / candidate, path)
-                            major_diffs = [diff for diff in diffs if not ignore.is_ignored(diff)]
-                            if not major_diffs:
-                                equivalent = candidate
-                                break
-                            else:
-                                self._output.produce_possible_duplicate(path, candidate, major_diffs, diffs)
-                        else:
-                            continue
+                        # Only one match will suffice as all files in an equivalent class share the same content
                         break
                 else:
+                    message_to_parent.deliver_nowait(DirectoryEntryResult(
+                        path.name, context.stat.st_size, False, [], [], []))
                     return
 
-                self._output.produce_duplicate(path, equivalent, diffs)
+                duplicates = []
+                content_wise_duplicates = []
+                # Find a file in the equivalent class which matches the file at 'path' with regard to their metadata
+                for candidate in paths:
+                    diffs = await self._processor.compare_metadata(self._archive_path / candidate, path)
+                    major_diffs = [diff for diff in diffs if not ignore.match(diff)]
+                    duplicate = DiscoveredDuplicate(candidate, major_diffs, diffs)
+                    if not major_diffs:
+                        duplicates.append(duplicate)
+                    else:
+                        content_wise_duplicates.append(duplicate)
 
-            for path, handle in self._walk(input):
-                if path.is_symlink():
-                    pass
-                elif path.is_file():
-                    await throttler.schedule(handle_file(path, handle))
+                # duplicates in directory view
+                dup_in_dir_view = [d for d in duplicates if d.path_in_archive.name == path.name]
+                # content-wise duplicates in directory view
+                cw_dup_in_dir_view = [d for d in content_wise_duplicates if d.path_in_archive.name == path.name]
+
+                Throttler.terminate_current_tenure()
+
+                if dup_in_dir_view:
+                    directory_result: DirectoryResult = await message_to_parent.deliver(DirectoryEntryResult(
+                        path.name, context.stat.st_size, False, [], dup_in_dir_view, cw_dup_in_dir_view))
+                    inhibit_file_report = directory_result.inhibit_file_report
                 else:
-                    pass
+                    message_to_parent.deliver_nowait(DirectoryEntryResult(
+                        path.name, context.stat.st_size, False, [], [], cw_dup_in_dir_view))
+                    inhibit_file_report = False
+
+                if not inhibit_file_report:
+                    if duplicates:
+                        self._output.describe_duplicate(
+                            path, False, [(d.path_in_archive, d.minor_diffs) for d in duplicates])
+                    else:
+                        self._output.describe_content_wise_duplicate(
+                            path, [(d.path_in_archive, d.major_diffs, d.minor_diffs) for d in content_wise_duplicates])
+
+            async def handle_directory_entries(
+                    path: Path, context: FileContext, message_to_parent: Message,
+                    reply: Callable[[DirectoryResult], None], entry_results: list[DirectoryEntryResult]):
+                child_count = 0
+                """The number of children of `path`"""
+                total_size = 0
+                """The total size of the content of `path`, where the sizes of special files are count as 0"""
+
+                children_deferred_comparison: list[str] = []
+                """The children of `path` that have not been compared by the task sending `message_to_parent`"""
+
+                def compare_non_regular_file(reference: Path, target: Path) -> bool:
+                    try:
+                        rst = reference.lstat()
+                        tst = target.lstat()
+                    except FileNotFoundError:
+                        return False
+
+                    if stat.S_ISREG(rst.st_mode) or stat.S_ISREG(tst.st_mode):
+                        return False
+
+                    if rst.st_mode != tst.st_mode:
+                        return False
+
+                    if stat.S_ISDIR(rst.st_mode):
+                        visited = set()
+
+                        for filename in (fn for it in [reference.iterdir(), target.iterdir()] for fn in it):
+                            if filename in visited:
+                                continue
+
+                            if not compare_non_regular_file(reference / filename, target / filename):
+                                return False
+
+                            visited.add(filename)
+                    elif stat.S_ISLNK(rst.st_mode):
+                        if os.readlink(reference) != os.readlink(target):
+                            return False
+                    else:
+                        return False
+
+                    return True
+
+                @dataclass
+                class CandidateInfo:
+                    """A directory in the archive that is possibly a duplicate of the directory at `path`."""
+                    duplicates: set[str]
+                    """The filenames of the duplicate children"""
+                    duplicate_size: int
+                    """The total size of the duplicate children in bytes"""
+                    content_wise_duplicates: set[str]
+                    """The filenames of children with duplicate content but different metadata"""
+                    content_wise_duplicate_size: int
+                    """The total size of children with duplicate content"""
+
+                candidates: dict[Path, CandidateInfo] = dict()
+                """The directories in the archive that is possibly a duplicate of the directory at `path`.
+                
+                The key is a relative path from the root of the archive. The value is a CandidateInfo object.
+                
+                An entry is not added unless a candidate has at least one child that is duplicate to a child of `path`
+                that has the same filename. It implies, if all the children of `path` are deferred for comparison, this 
+                dictionary will be empty."""
+
+                for entry_result in entry_results:
+                    child_count += 1
+                    total_size += entry_result.file_size
+
+                    if entry_result.deferred_comparison:
+                        children_deferred_comparison.append(entry_result.name)
+                    else:
+                        for full, duplicate in \
+                                [(True, d) for d in entry_result.duplicates] + \
+                                [(False, d) for d in entry_result.duplicates]:
+                            # skip if `duplicate.path_in_archive` is the root
+                            if duplicate.path_in_archive.parent == duplicate.path_in_archive:
+                                continue
+
+                            # it's implied that `entry_result.name` == `duplicate.path_in_archive.name` because it's
+                            # checked before the message is sent from the child
+
+                            candidate_path = duplicate.path_in_archive.parent
+
+                            if candidate_path not in candidates:
+                                candidates[candidate_path] = CandidateInfo(set(), 0, set(), 0)
+
+                            candidate = candidates[candidate_path]
+
+                            if full:
+                                candidate.duplicates.add(entry_result.name)
+                                candidate.duplicate_size += entry_result.file_size
+
+                            candidate.content_wise_duplicates.add(entry_result.name)
+                            candidate.content_wise_duplicate_size += entry_result.file_size
+
+                extensions: list[DiscoveredDuplicate] = []
+                """The directories that are proper supersets to `path`"""
+                duplicates: list[DiscoveredDuplicate] = []
+                """The directories that are exact duplicates to `path`"""
+
+                for candidate_path, candidate in candidates.items():
+                    candidate_children: set[str] = set()
+                    """All the children this candidate has"""
+
+                    candidate_immediate_child_total_size = 0
+
+                    child: Path
+                    for child in (self._archive_path / candidate_path).iterdir():
+                        candidate_children.add(child.name)
+
+                        st = child.lstat()
+                        if stat.S_ISREG(st.st_mode):
+                            candidate_immediate_child_total_size += st.st_size
+
+                        if child.name in children_deferred_comparison:
+                            if compare_non_regular_file(
+                                    self._archive_path / candidate_path / child.name, path / child.name):
+                                candidate.duplicates.add(child.name)
+
+                    if len(candidate.duplicates) >= child_count:
+                        # TODO generate minor differences for DiscoveredDuplicate
+                        if not candidate_children.difference(candidate.duplicates):
+                            duplicates.append(DiscoveredDuplicate(candidate_path, [], []))
+                        elif len(candidate.duplicates) > 1:
+                            extensions.append(DiscoveredDuplicate(candidate_path, [], []))
+
+                if extensions or duplicates:
+                    reply(DirectoryResult(inhibit_file_report=len(duplicates) > 0))
+
+                    directory_result: DirectoryResult = await message_to_parent.deliver(DirectoryEntryResult(
+                        path.name, total_size, False, extensions, duplicates, []))
+
+                    if not directory_result.inhibit_file_report:
+                        if duplicates:
+                            self._output.describe_duplicate(
+                                path, True, [(d.path_in_archive, d.minor_diffs) for d in duplicates])
+
+                        # TODO
+                        if extensions:
+                            pass
+                else:
+                    reply(DirectoryResult(inhibit_file_report=False))
+
+                    deferred_comparison = \
+                        len(children_deferred_comparison) > 0 and len(children_deferred_comparison) >= child_count
+                    message_to_parent.deliver_nowait(DirectoryEntryResult(
+                        path.name, total_size, deferred_comparison, [], [], []))
+
+            def make_default_directory_result():
+                return DiscardedMessage(DirectoryResult(inhibit_file_report=False))
+
+            for path, context in self._walk(input):
+                message_to_parent = context.parent.send_message(handle_directory_entries, make_default_directory_result)
+
+                if stat.S_ISREG(context.stat.st_mode):
+                    await throttler.schedule(handle_file(path, context, message_to_parent))
+                elif stat.S_ISDIR(context.stat.st_mode):
+                    context.register_message_processor(
+                        tg, handle_directory_entries,
+                        partial(handle_directory_entries, path, context, message_to_parent))
+                else:
+                    message_to_parent.deliver_nowait(DirectoryEntryResult(
+                        path.name, context.stat.st_size, True, [], [], []))
 
     def inspect(self) -> Iterator[str]:
         hash_algorithm = self._read_config(Archive.__CONFIG_HASH_ALGORITHM)
@@ -498,7 +879,14 @@ class Archive:
             signature = FileSignature(*msgpack.loads(value))
             yield path, signature
 
-    def _register_file_equivalents(self, digest: bytes, ec_id: int, paths: list[Path]) -> None:
+    def _store_content_equivalent_class(self, digest: bytes, ec_id: int, paths: list[Path]) -> None:
+        """
+        Store an equivalent class in which all the files share the same content exactly.
+
+        :param digest: the digest of the content of files
+        :param ec_id: the id of this equivalent class, local to this particular digest
+        :param paths: the paths of files in the equivalent class, relative to the archive root
+        """
         key = digest + ec_id.to_bytes(length=4).lstrip(b'\0')
 
         if not paths:
@@ -509,35 +897,45 @@ class Archive:
             data = msgpack.dumps(data)
             self._file_hash_database.put(key, data)
 
-    def _lookup_file_equivalents(self, digest: bytes) -> Iterable[tuple[int, list[Path]]]:
+    def _list_content_equivalent_classes(self, digest: bytes) -> Iterable[tuple[int, list[Path]]]:
+        """
+        List all the equivalent classes where the digest of content the files of each equivalent class matches the
+        specified argument.
+
+        :param digest: the digest of the content of files
+        """
         ec_db: plyvel.DB = self._file_hash_database.prefixed_db(digest)
         for key, data in ec_db.iterator():
             ec_id = int.from_bytes(key)
             data: list[list[str]] = msgpack.loads(data)
             yield ec_id, [Path(*parts) for parts in data]
 
-    def _walk_archive(self) -> Iterator[tuple[Path, FileHandle]]:
-        handle = FileHandle(None, None, self._archive_path.stat())
-        handle.exclude('.aridx')
-        yield from self.__walk_recursively(self._archive_path, handle)
+    def _walk_archive(self) -> Iterator[tuple[Path, FileContext]]:
+        context = FileContext(None, None, self._archive_path.stat())
+        context.exclude('.aridx')
+        yield from self.__walk_recursively(self._archive_path, context)
+        context.complete()
 
-    def _walk(self, path: Path) -> Iterator[tuple[Path, FileHandle]]:
-        handle = FileHandle(None, None, path.stat())
-        yield path, handle
-        yield from self.__walk_recursively(path, handle)
+    def _walk(self, path: Path) -> Iterator[tuple[Path, FileContext]]:
+        st = path.stat(follow_symlinks=False)
+        pseudo_parent = FileContext(None, None, st)
+        context = FileContext(pseudo_parent, path.name, st)
+        yield path, context
+        yield from self.__walk_recursively(path, context)
+        context.complete()
+        pseudo_parent.complete()
 
-    def __walk_recursively(self, path: Path, parent: FileHandle) -> Iterator[tuple[Path, FileHandle]]:
+    def __walk_recursively(self, path: Path, parent: FileContext) -> Iterator[tuple[Path, FileContext]]:
         child: Path
         for child in path.iterdir():
             if parent.is_excluded(child.name):
                 continue
 
             st = child.stat(follow_symlinks=False)
-            handle = FileHandle(parent, child.name, st)
-            parent.register_child()
+            context = FileContext(parent, child.name, st)
             if stat.S_ISDIR(st.st_mode):
-                yield child, handle
-                yield from self.__walk_recursively(child, handle)
-                handle.set_scanned()
+                yield child, context
+                yield from self.__walk_recursively(child, context)
+                context.complete()
             else:
-                yield child, handle
+                yield child, context
