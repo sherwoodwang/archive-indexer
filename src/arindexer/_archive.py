@@ -9,7 +9,7 @@ from asyncio import TaskGroup, Semaphore, Lock, Condition, Future
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, Iterator, Iterable, Callable, Awaitable, TypeAlias, final
+from typing import Any, Iterator, Iterable, Callable, Awaitable, TypeAlias
 
 import msgpack
 import plyvel
@@ -340,13 +340,15 @@ class Output(metaclass=abc.ABCMeta):
 
         self._offer(record)
 
-    def describe_content_wise_duplicate(self, path, duplicates):
+    def describe_content_wise_duplicate(self, path, is_directory: bool, duplicates):
         if self.showing_content_wise_duplicates:
-            record = [f'# content-wise duplicate: {str(path)}']
+            suffix = os.sep if is_directory else ''
+            record = [f'# content-wise duplicate: {str(path)}{suffix}']
 
             if self.verbosity >= 1:
                 for candidate, major_diffs, diffs in duplicates:
-                    record.append(f"## file with identical content: {candidate}")
+                    record.append(
+                        f"## {'directory' if is_directory else 'file'} with identical content: {candidate}{suffix}")
 
                     for diff in major_diffs:
                         record.append(f"## difference - {diff.description('indexed', 'target')}")
@@ -624,7 +626,8 @@ class Archive:
                             path, False, [(d.path_in_archive, d.minor_diffs) for d in duplicates])
                     else:
                         self._output.describe_content_wise_duplicate(
-                            path, [(d.path_in_archive, d.major_diffs, d.minor_diffs) for d in content_wise_duplicates])
+                            path, False,
+                            [(d.path_in_archive, d.major_diffs, d.minor_diffs) for d in content_wise_duplicates])
 
             async def handle_directory_entries(
                     path: Path, context: FileContext, message_to_parent: Message,
@@ -699,7 +702,7 @@ class Archive:
                     else:
                         for full, duplicate in \
                                 [(True, d) for d in entry_result.duplicates] + \
-                                [(False, d) for d in entry_result.duplicates]:
+                                [(False, d) for d in entry_result.content_wise_duplicates]:
                             # skip if `duplicate.path_in_archive` is the root
                             if duplicate.path_in_archive.parent == duplicate.path_in_archive:
                                 continue
@@ -725,43 +728,50 @@ class Archive:
                 """The directories that are proper supersets to `path`"""
                 duplicates: list[DiscoveredDuplicate] = []
                 """The directories that are exact duplicates to `path`"""
+                content_wise_duplicates: list[DiscoveredDuplicate] = []
+                """The directories all files of which share the same content to `path`"""
 
                 for candidate_path, candidate in candidates.items():
                     candidate_children: set[str] = set()
                     """All the children this candidate has"""
 
-                    candidate_immediate_child_total_size = 0
-
                     child: Path
                     for child in (self._archive_path / candidate_path).iterdir():
                         candidate_children.add(child.name)
-
-                        st = child.lstat()
-                        if stat.S_ISREG(st.st_mode):
-                            candidate_immediate_child_total_size += st.st_size
 
                         if child.name in children_deferred_comparison:
                             if compare_non_regular_file(
                                     self._archive_path / candidate_path / child.name, path / child.name):
                                 candidate.duplicates.add(child.name)
+                                candidate.content_wise_duplicates.add(child.name)
 
+                    # TODO generate minor differences for DiscoveredDuplicate;
+                    #      handle the metadata of the directory.
                     if len(candidate.duplicates) >= child_count:
-                        # TODO generate minor differences for DiscoveredDuplicate
                         if not candidate_children.difference(candidate.duplicates):
                             duplicates.append(DiscoveredDuplicate(candidate_path, [], []))
+                            content_wise_duplicates.append(DiscoveredDuplicate(candidate_path, [], []))
                         elif len(candidate.duplicates) > 1:
                             extensions.append(DiscoveredDuplicate(candidate_path, [], []))
+                    elif len(candidate.content_wise_duplicates) >= child_count:
+                        if not candidate_children.difference(candidate.content_wise_duplicates):
+                            content_wise_duplicates.append(DiscoveredDuplicate(candidate_path, [], []))
 
-                if extensions or duplicates:
+                if extensions or duplicates or content_wise_duplicates:
+                    # TODO inhibit reports of content-wise duplicates
                     reply(DirectoryResult(inhibit_file_report=len(duplicates) > 0))
 
                     directory_result: DirectoryResult = await message_to_parent.deliver(DirectoryEntryResult(
-                        path.name, total_size, False, extensions, duplicates, []))
+                        path.name, total_size, False, extensions, duplicates, content_wise_duplicates))
 
                     if not directory_result.inhibit_file_report:
                         if duplicates:
                             self._output.describe_duplicate(
                                 path, True, [(d.path_in_archive, d.minor_diffs) for d in duplicates])
+                        elif content_wise_duplicates:
+                            self._output.describe_content_wise_duplicate(
+                                path, True,
+                                [(d.path_in_archive, d.major_diffs, d.minor_diffs) for d in content_wise_duplicates])
 
                         # TODO
                         if extensions:
